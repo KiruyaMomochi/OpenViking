@@ -15,8 +15,20 @@ logger = logging.getLogger(__name__)
 # Regex patterns for MEMORY_FIELDS HTML comment
 _MEMORY_FIELDS_PATTERN = re.compile(r"\n\n<!--\s*MEMORY_FIELDS\s*\n(.*?)\n-->", re.DOTALL)
 _MEMORY_FIELDS_PATTERN_END = re.compile(r"<!--\s*MEMORY_FIELDS\s*\n(.*?)\n-->$", re.DOTALL)
+_CHATLOG_RE = re.compile(r"\n\d{4}-\d{2}-\d{2}.*?ChatLog:\s*\n")
 
 DEFAULT_TRUNCATE_MAX_CHARS = 1000
+MEMORY_ABSTRACT_MAX_CHARS = 1500
+
+
+def _extract_memory_abstract(content: str, max_chars: int = MEMORY_ABSTRACT_MAX_CHARS) -> str:
+    """Extract summary portion before ChatLog marker for use as vector metadata."""
+    match = _CHATLOG_RE.search(content)
+    if match:
+        summary = content[: match.start()].strip()
+        if summary:
+            return summary[:max_chars]
+    return content[:max_chars]
 
 
 def memory_version_from_fields(fields: Optional[Dict[str, Any]], *, default: int = 1) -> int:

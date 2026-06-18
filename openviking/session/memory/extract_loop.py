@@ -440,6 +440,14 @@ The final output of the model must strictly follow the JSON Schema format shown 
                         extract_context=self._extract_context,
                     )
 
+                if not resolved_op.uris:
+                    logger.warning(
+                        "Skipping unresolved upsert operation (page_id=%s, scope=%s) — no URIs resolved",
+                        getattr(resolved_op, "page_id", "?"),
+                        getattr(resolved_op, "scope", "?"),
+                    )
+                    continue
+
                 upsert_operations.append(resolved_op)
 
         delete_ids = self._normalize_delete_ids(getattr(operations, "delete_ids", []) or [])

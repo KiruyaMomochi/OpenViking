@@ -30,6 +30,7 @@ from openviking.session.memory.merge_op import MergeOpFactory
 from openviking.session.memory.page_id_map import PageIdMap
 from openviking.session.memory.utils.memory_file_utils import (
     MemoryFileUtils,
+    _extract_memory_abstract,
     bump_memory_version,
     next_memory_version,
 )
@@ -1396,16 +1397,18 @@ class MemoryUpdater:
                 mf = MemoryFileUtils.read(content, uri=uri)
                 from openviking.session.memory.utils.link_renderer import LinkRenderer
 
-                abstract = LinkRenderer.strip_all_links(mf.content or "")
+                plain_content = mf.plain_content()
+                abstract_content = LinkRenderer.strip_all_links(mf.content or "")
+                abstract = _extract_memory_abstract(abstract_content)
                 abstract = self._truncate_memory_abstract(abstract)
-                embedding_text = abstract
+                embedding_text = plain_content
 
                 memory_type = uri_memory_type_map.get(uri)
                 if memory_type and self._registry:
                     schema = self._registry.get(memory_type)
                     if schema and schema.embedding_template:
                         template_vars = dict(mf.extra_fields)
-                        template_vars["content"] = abstract
+                        template_vars["content"] = plain_content
                         missing_vars = TemplateUtils.find_missing_variables(
                             schema.embedding_template,
                             template_vars,
