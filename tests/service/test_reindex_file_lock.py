@@ -8,7 +8,23 @@ from unittest.mock import AsyncMock
 from openviking.server.identity import RequestContext, Role
 from openviking.service import reindex_executor as reindex_module
 from openviking.service.reindex_executor import ReindexExecutor
+from openviking.session.memory.utils.memory_file_utils import _extract_memory_abstract
+from openviking.storage.transaction import init_lock_manager, release_all_locks, reset_lock_manager
 from openviking_cli.session.user_id import UserIdentifier
+
+
+def test_reindex_memory_abstract_uses_summary_before_chatlog():
+    body = (
+        "Concise memory summary for search injection.\n"
+        "2026-06-13 (Saturday) ChatLog:\n"
+        "[assistant]: verbose transcript should not be metadata\n"
+    )
+
+    abstract = _extract_memory_abstract(body)
+
+    assert abstract == "Concise memory summary for search injection."
+    assert "ChatLog" not in abstract
+    assert "verbose transcript" not in abstract
 
 
 class _FakeVikingFS:

@@ -27,7 +27,10 @@ from openviking.core.namespace import (
 from openviking.server.dependencies import get_service
 from openviking.server.identity import RequestContext
 from openviking.service.task_tracker import get_task_tracker
-from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
+from openviking.session.memory.utils.memory_file_utils import (
+    MemoryFileUtils,
+    _extract_memory_abstract,
+)
 from openviking.storage.abstract_overview import body_for_preview, embedding_text_for_body
 from openviking.storage.queuefs.embedding_msg_converter import EmbeddingMsgConverter
 from openviking.storage.queuefs.semantic_msg import SemanticMsg
@@ -1334,15 +1337,20 @@ class ReindexExecutor:
                 )
                 return file_counters
             body = body_source.text if body_source.exists else ""
-            memory_content = MemoryFileUtils.read(body).content if body else ""
+            memory_file = MemoryFileUtils.read(body) if body else None
+            memory_content = memory_file.content if memory_file else ""
+            memory_plain_content = memory_file.plain_content() if memory_file else ""
             existing = await self._fetch_existing_record(
                 uri=file_uri,
                 level=2,
                 ctx=self._content_owner_ctx(file_uri, ctx),
             )
             abstract = self._best_non_empty(
-                self._record_abstract(existing),
                 await self._best_file_summary(file_uri, ctx=ctx),
+                _extract_memory_abstract(memory_plain_content),
+                _extract_memory_abstract(memory_content),
+                _extract_memory_abstract(body),
+                self._record_abstract(existing),
             )
             if not body and existing is None:
                 file_counters.unsupported_records += 1
@@ -1351,7 +1359,12 @@ class ReindexExecutor:
 
             parent_uri = VikingURI(file_uri.split("#", 1)[0]).parent.uri
             if body:
-                detail_abstract = self._prefer_non_empty(abstract, memory_content, body)
+                detail_abstract = self._prefer_non_empty(
+                    abstract,
+                    _extract_memory_abstract(memory_plain_content),
+                    _extract_memory_abstract(memory_content),
+                    _extract_memory_abstract(body),
+                )
                 try:
                     await self._upsert_context(
                         uri=file_uri,

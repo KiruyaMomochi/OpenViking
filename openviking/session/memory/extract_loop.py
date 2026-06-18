@@ -901,6 +901,14 @@ class ExtractLoop:
                         extract_context=self._extract_context,
                     )
 
+                if not resolved_op.uris:
+                    logger.warning(
+                        "Skipping unresolved upsert operation (page_id=%s, scope=%s) — no URIs resolved",
+                        getattr(resolved_op, "page_id", "?"),
+                        getattr(resolved_op, "scope", "?"),
+                    )
+                    continue
+
                 upsert_operations.append(resolved_op)
 
         delete_replacements: dict[str, str] = {}
