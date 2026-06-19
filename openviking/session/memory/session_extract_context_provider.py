@@ -10,6 +10,7 @@ import re
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from openviking.message.part import TextPart, ToolPart
+from openviking.prompts.manager import PromptManager
 from openviking.server.identity import RequestContext, ToolContext
 from openviking.session.memory.core import ExtractContextProvider
 from openviking.session.memory.dataclass import MemoryFile
@@ -82,6 +83,9 @@ class SessionExtractContextProvider(ExtractContextProvider):
         config = get_openviking_config()
         self._eager_prefetch = config.memory.eager_prefetch if config.memory else False
         self._prefetch_search_topn = config.memory.prefetch_search_topn if config.memory else 5
+        self._speaker_labels = dict(
+            getattr(getattr(config, "session", None), "speaker_labels", {}) or {}
+        )
         self._ctx = ctx
         self._viking_fs = viking_fs
         self._transaction_handle = transaction_handle
@@ -184,6 +188,30 @@ class SessionExtractContextProvider(ExtractContextProvider):
     def get_output_language(self) -> str:
         return self._output_language
 
+    def _speaker_label_for_role(self, role: str) -> str:
+        """Return configured display label for a role, preserving role fallback by default."""
+        return self._speaker_labels.get(role) or role
+
+    def _speaker_for_message(self, message: Any) -> str:
+        """Return stable peer_id when present, otherwise the configured role label."""
+        role = getattr(message, "role", "") or ""
+        return getattr(message, "peer_id", "") or self._speaker_label_for_role(role)
+
+    def _speaker_labels_instruction(self) -> str:
+        labels = [
+            f"- {role} = {label}"
+            for role, label in sorted(self._speaker_labels.items())
+            if label and label != role
+        ]
+        if not labels:
+            return ""
+        return """
+## Speaker Labels
+When a message does not include a peer_id, formatted conversation headers use these display labels instead of raw role strings:
+%s
+Use message role for ownership/routing rules; these labels are only display names for conversation speakers.
+""" % "\n".join(labels)
+
     def _conversation_contains_resource_uri(self) -> bool:
         for message in self.messages or []:
             content = getattr(message, "content", None)
@@ -218,41 +246,16 @@ class SessionExtractContextProvider(ExtractContextProvider):
             if contains_resource_uri
             else ""
         )
-        goal = f"""You are a memory extraction and maintenance agent. Analyze the conversation together with the pre-fetched existing memories, then produce a single atomic plan to create, update, delete, or reorganize memories so that the final memory collection conforms to all enabled memory schemas.
-
-## Workflow
-1. Analyze the conversation and pre-fetched context
-2. If you need more information, use the available tools (read/search)
-3. When you have enough information, output ONLY a JSON object (no extra text before or after)
-
-## Critical
-- ONLY read and search tools are available - DO NOT use write tool
-- Before editing ANY existing memory file, you MUST first read its complete content
-- ONLY read URIs that are explicitly listed in ls/search tool results, returned by previous tool calls{resource_deletion_read_source}
-
-## Target Output Language
-All memory content MUST be written in {output_language}.
-
-## URI Handling
-The system automatically generates URIs based on memory_type and fields. Just provide correct memory_type and fields.
-{resource_uri_handling}
-
-## Self and Peer Memory
-When a memory item describes the current user, omit peer_id.
-When a memory item describes a peer, set peer_id to one of the peer_id values allowed by
-the output schema. Do not invent peer_id values.
-For memory items that carry a message-range field, the system derives self/peer targets from that range.
-Message role is authoritative for newly extracted facts: attribute each fact to the speaker whose
-message states it, and follow each enabled memory type's own schema rules for which role its content
-comes from. Do not infer ownership from neighboring messages.
-Facts already stored in pre-fetched or explicitly read memories remain valid sources for
-maintenance and may be preserved, normalized, merged, split, or moved between enabled memory
-types when required by their schemas.
-
-{MEMORY_MERGE_POLICY}
-"""
-
-        return goal
+        return PromptManager(enable_caching=False).render(
+            "memory.session_extraction_instruction",
+            {
+                "output_language": output_language,
+                "resource_uri_handling": resource_uri_handling,
+                "resource_deletion_read_source": resource_deletion_read_source,
+                "speaker_labels_instruction": self._speaker_labels_instruction(),
+                "memory_merge_policy": MEMORY_MERGE_POLICY,
+            },
+        )
 
     def _build_conversation_message(self) -> Dict[str, Any]:
         """构建包含 Conversation History 的 user message"""
@@ -342,7 +345,7 @@ After exploring, analyze the conversation and output ALL memory write/edit/delet
             body = format_message_with_parts(msg)
             if not body.strip():
                 return None
-            speaker = msg.peer_id or msg.role
+            speaker = self._speaker_for_message(msg)
             return f"[{idx}][{msg.role}][{speaker}]: {body}"
 
         formatted_messages = [
@@ -375,7 +378,7 @@ After exploring, analyze the conversation and output ALL memory write/edit/delet
 
         for msg in self.messages:
             role = getattr(msg, "role", "")
-            speaker = getattr(msg, "peer_id", "") or role
+            speaker = self._speaker_for_message(msg)
             parts = getattr(msg, "parts", [])
 
             text_parts: List[str] = []

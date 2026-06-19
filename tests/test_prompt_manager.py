@@ -153,6 +153,14 @@ def test_prompt_manager_falls_back_to_bundled_templates_dir(monkeypatch):
     assert manager.templates_dir == PromptManager._get_bundled_templates_dir()
 
 
+def test_openviking_config_accepts_session_speaker_labels():
+    config = OpenVikingConfigSingleton.initialize(
+        config_dict={"session": {"speaker_labels": {"user": "33", "assistant": "螢"}}}
+    )
+
+    assert config.session.speaker_labels == {"user": "33", "assistant": "螢"}
+
+
 def test_prompt_manager_falls_back_to_bundled_template_when_custom_dir_is_partial(
     tmp_path, monkeypatch
 ):

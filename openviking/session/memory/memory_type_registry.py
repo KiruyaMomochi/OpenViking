@@ -133,22 +133,37 @@ class MemoryTypeRegistry:
             return list(self._types.keys())
         return [mt.memory_type for mt in self._types.values() if mt.enabled]
 
-    def load_from_yaml(self, yaml_path: str, replace: bool = False) -> None:
+    def load_from_yaml(self, yaml_path: str, replace: bool = False) -> bool:
         """
         Load memory type from a YAML file.
 
         Args:
             yaml_path: Path to YAML file
             replace: If True, replace existing memory type; if False, raise error on duplicate
+
+        Returns:
+            True when a memory schema was loaded, False when the file is a non-schema prompt template.
         """
         with open(yaml_path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f)
+
+        if self._is_prompt_template(data):
+            logger.debug("Skipping prompt template in memory schema directory: %s", yaml_path)
+            return False
 
         memory_type = self._parse_memory_type(data)
         if replace:
             self.replace(memory_type)
         else:
             self.register(memory_type)
+        return True
+
+    @staticmethod
+    def _is_prompt_template(data: Any) -> bool:
+        """Return True for PromptManager YAML templates stored beside memory schemas."""
+        if not isinstance(data, dict):
+            return False
+        return "metadata" in data and "template" in data and "memory_type" not in data and "name" not in data
 
     def load_from_directory(self, dir_path: str, replace: bool = False) -> int:
         """
@@ -170,15 +185,15 @@ class MemoryTypeRegistry:
 
         for yaml_file in dir_path_obj.glob("*.yaml"):
             try:
-                self.load_from_yaml(str(yaml_file), replace=replace)
-                count += 1
+                if self.load_from_yaml(str(yaml_file), replace=replace):
+                    count += 1
             except Exception as e:
                 logger.error(f"Failed to load {yaml_file}: {e}")
 
         for yaml_file in dir_path_obj.glob("*.yml"):
             try:
-                self.load_from_yaml(str(yaml_file), replace=replace)
-                count += 1
+                if self.load_from_yaml(str(yaml_file), replace=replace):
+                    count += 1
             except Exception as e:
                 logger.error(f"Failed to load {yaml_file}: {e}")
 

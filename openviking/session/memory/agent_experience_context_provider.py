@@ -12,6 +12,7 @@ source_trajectories as grounding material.
 
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
+from openviking.prompts.manager import PromptManager
 from openviking.pyagfs.exceptions import AGFSNotFoundError
 from openviking.server.identity import RequestContext
 from openviking.session.memory.dataclass import MemoryFile
@@ -66,39 +67,15 @@ class AgentExperienceContextProvider(SessionExtractContextProvider):
 
     def instruction(self) -> str:
         output_language = self._output_language
-        return f"""You are a memory extraction agent. Your job is to distill experience memories from agent execution trajectories.
-
-You are given:
-- A new trajectory (the latest agent execution to incorporate)
-- Up to {SEARCH_TOP_K} candidate existing experiences (retrieved by relevance). Top candidates also include their source trajectories as grounding material.
-
-The source trajectories are for reference only — do NOT include or modify them in your output.
-
-## What to output
-
-For each distinct user intent in the trajectory, output a SEPARATE experience entry. A single trajectory may contain multiple user intents — you MUST produce one entry per intent, not one entry for the whole trajectory.
-
-Each entry:
-- `experience_name`: the name of the experience (new or existing)
-- `content`: the full experience content (rewrite holistically, incorporating old + new)
-- `supersedes`: the `experience_name` of an older experience this one replaces — set ONLY when the new name is genuinely different and broader. Leave empty otherwise.
-
-The system handles create vs update automatically:
-- Same `experience_name` as an existing one → updates it in place
-- New `experience_name` → creates a new experience
-- `supersedes` set → old experience is deleted and its history is inherited
-
-## Rules
-
-- **One experience per distinct user intent.** If a trajectory covers N different user goals (e.g., cancel + modify + add baggage), output N separate entries — never merge them into one.
-- **Split over merge.** When in doubt whether two patterns belong together, split them. Only merge with an existing experience when it covers the EXACT same user intent and tool sequence.
-- **Consistent naming language.** All `experience_name` values in one output must use the same language.
-- **Do NOT use `delete_ids`** for experience operations — use `supersedes` instead.
-- Follow field descriptions in the schema.
-- Output JSON only. Do not call any tools.
-
-All memory content must be written in {output_language}.
-"""
+        speaker_labels_instruction = self._speaker_labels_instruction()
+        return PromptManager(enable_caching=False).render(
+            "memory.agent_experience_instruction",
+            {
+                "output_language": output_language,
+                "search_top_k": SEARCH_TOP_K,
+                "speaker_labels_instruction": speaker_labels_instruction,
+            },
+        )
 
     def get_memory_schemas(self, ctx: RequestContext) -> List[Any]:
         registry = self._get_registry()

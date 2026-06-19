@@ -236,6 +236,47 @@ class TestSessionConversationToolFiltering:
         assert "[0][user][web-visitor-alice]" in conversation
         assert "[0][user][default]" not in conversation
 
+    def test_assemble_conversation_uses_configured_speaker_label_when_peer_id_is_absent(
+        self, monkeypatch
+    ):
+        config = SimpleNamespace(
+            memory=SimpleNamespace(
+                eager_prefetch=False,
+                prefetch_search_topn=5,
+                link_enabled=False,
+            ),
+            session=SimpleNamespace(
+                speaker_labels={"user": "33", "assistant": "螢"},
+            ),
+        )
+        monkeypatch.setattr(
+            "openviking.session.memory.session_extract_context_provider.get_openviking_config",
+            lambda: config,
+        )
+        messages = [
+            Message(id="m1", role="user", parts=[TextPart("hello")]),
+            Message(id="m2", role="assistant", parts=[TextPart("hi")]),
+        ]
+        provider = SessionExtractContextProvider(messages=messages)
+
+        conversation = provider._assemble_conversation(messages)
+        query = provider._build_prefetch_search_query()
+
+        assert "[0][user][33]: hello" in conversation
+        assert "[1][assistant][螢]: hi" in conversation
+        assert "33: hello" in query
+        assert "螢: hi" in query
+        assert "[0][user][user]" not in conversation
+        assert "[1][assistant][assistant]" not in conversation
+
+    def test_assemble_conversation_keeps_role_fallback_when_speaker_label_unset(self):
+        messages = [Message(id="m1", role="user", parts=[TextPart("hello")])]
+        provider = SessionExtractContextProvider(messages=messages)
+
+        conversation = provider._assemble_conversation(messages)
+
+        assert "[0][user][user]: hello" in conversation
+
     def test_detect_language_only_uses_text_parts(self):
         messages = [
             Message(
