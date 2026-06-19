@@ -47,6 +47,7 @@ from openviking.telemetry.tracer import get_trace_id
 from openviking.utils.time_utils import parse_iso_datetime
 from openviking_cli.exceptions import NotFoundError
 from openviking_cli.utils import VikingURI, get_logger
+from openviking_cli.utils.config import get_openviking_config
 
 logger = get_logger(__name__)
 
@@ -631,8 +632,17 @@ class MessageRange:
         return formatted
 
     @staticmethod
-    def _speaker_for(message: Message) -> str:
-        return getattr(message, "peer_id", None) or message.role
+    def _speaker_labels() -> Dict[str, str]:
+        try:
+            config = get_openviking_config()
+        except FileNotFoundError:
+            return {}
+        return dict(getattr(getattr(config, "session", None), "speaker_labels", {}) or {})
+
+    @classmethod
+    def _speaker_for(cls, message: Message) -> str:
+        role = getattr(message, "role", "") or ""
+        return getattr(message, "peer_id", None) or cls._speaker_labels().get(role) or role
 
     def _can_merge_messages(self, previous: Message, current: Message) -> bool:
         previous_meta = self._chunk_meta_for(previous)

@@ -81,6 +81,7 @@ from .parser_config import (
 from .prompts_config import PromptsConfig
 from .rerank_config import RerankConfig
 from .retrieval_config import RetrievalConfig
+from .session_config import SessionConfig
 from .storage_config import StorageConfig
 from .telemetry_config import TelemetryConfig, TracerConfig
 from .vectordb_config import VectorDBBackendConfig
@@ -137,6 +138,7 @@ __all__ = [
     "GrepEngine",
     "RerankConfig",
     "RetrievalConfig",
+    "SessionConfig",
     "StorageConfig",
     "VectorDBBackendConfig",
     "VLMConfig",

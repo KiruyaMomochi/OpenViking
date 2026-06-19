@@ -74,6 +74,37 @@ def test_message_range_accepts_extended_fractional_seconds():
     assert msg_range._first_message_time_with_weekday() == "2026-04-17 (Friday)"
 
 
+def test_message_range_uses_peer_id_when_present():
+    msg_range = MessageRange(
+        [
+            [
+                Message(
+                    id="msg-peer",
+                    role="user",
+                    parts=[TextPart(text="invoice follow-up")],
+                    peer_id="web-visitor-alice",
+                )
+            ]
+        ]
+    )
+
+    assert "[web-visitor-alice]: invoice follow-up" in msg_range.pretty_print()
+    assert "[default]: invoice follow-up" not in msg_range.pretty_print()
+
+
+def test_message_range_uses_configured_speaker_label_without_peer_id(monkeypatch):
+    config = SimpleNamespace(session=SimpleNamespace(speaker_labels={"user": "33"}))
+    monkeypatch.setattr(
+        "openviking.session.memory.memory_updater.get_openviking_config",
+        lambda: config,
+    )
+    msg_range = MessageRange(
+        [[Message(id="msg-user", role="user", parts=[TextPart(text="invoice follow-up")])]]
+    )
+
+    assert msg_range.pretty_print() == "[33]: invoice follow-up"
+
+
 def test_extraction_context_chunks_long_text_and_preserves_decimal_numbers(stub_provider_config):
     text = (
         "周一 "

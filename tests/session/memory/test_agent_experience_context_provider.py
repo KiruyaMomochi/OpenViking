@@ -79,6 +79,32 @@ def test_agent_only_schemas_are_excluded_from_peer_user_memory_extraction():
     assert "trajectories" not in schema_types
 
 
+def test_agent_experience_instruction_injects_configured_speaker_labels(monkeypatch):
+    config = SimpleNamespace(
+        memory=SimpleNamespace(
+            eager_prefetch=False,
+            prefetch_search_topn=5,
+            link_enabled=False,
+        ),
+        session=SimpleNamespace(speaker_labels={"user": "33", "assistant": "螢"}),
+    )
+    monkeypatch.setattr(
+        "openviking.session.memory.session_extract_context_provider.get_openviking_config",
+        lambda: config,
+    )
+    provider = AgentExperienceContextProvider(
+        messages=[],
+        trajectory_summary="album release party discussion",
+        trajectory_uri="viking://user/user_sample_9/memories/trajectories/album_release_party_discussion.md",
+    )
+
+    instruction = provider.instruction()
+
+    assert "Speaker Labels" in instruction
+    assert "user = 33" in instruction
+    assert "assistant = 螢" in instruction
+
+
 @pytest.mark.asyncio
 async def test_agent_experience_prefetch_starts_with_conversation_and_new_trajectory_read():
     provider = AgentExperienceContextProvider(

@@ -46,6 +46,7 @@ from .prompts_config import PromptsConfig
 from .queue_worker_config import QueueWorkersConfig
 from .rerank_config import RerankConfig
 from .retrieval_config import RetrievalConfig
+from .session_config import SessionConfig
 from .storage_config import StorageConfig
 from .telemetry_config import TelemetryConfig
 from .vlm_config import VLMConfig
@@ -367,6 +368,11 @@ class OpenVikingConfig(BaseModel):
 
     memory: MemoryConfig = Field(default_factory=MemoryConfig, description="Memory configuration")
 
+    session: SessionConfig = Field(
+        default_factory=SessionConfig,
+        description="Session formatting configuration",
+    )
+
     oauth: OAuthConfig = Field(
         default_factory=OAuthConfig,
         description="OAuth 2.1 (MCP) configuration",
@@ -445,6 +451,11 @@ class OpenVikingConfig(BaseModel):
             if "memory" in config_copy:
                 memory_config_data = config_copy.pop("memory")
 
+            # Handle session configuration from nested "session" section
+            session_config_data = None
+            if "session" in config_copy:
+                session_config_data = config_copy.pop("session")
+
             instance = cls(**config_copy)
 
             # Apply log configuration
@@ -461,6 +472,19 @@ class OpenVikingConfig(BaseModel):
                             root_model=MemoryConfig,
                             error=e,
                             path_prefix="memory",
+                        )
+                    ) from e
+
+            # Apply session configuration
+            if session_config_data is not None:
+                try:
+                    instance.session = SessionConfig.from_dict(session_config_data)
+                except ValidationError as e:
+                    raise ValueError(
+                        format_validation_error(
+                            root_model=SessionConfig,
+                            error=e,
+                            path_prefix="session",
                         )
                     ) from e
 
