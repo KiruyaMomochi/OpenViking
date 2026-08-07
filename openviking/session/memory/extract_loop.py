@@ -792,6 +792,9 @@ class ExtractLoop:
                 item_dict = dict(item)
                 item_dict["memory_type"] = memory_type
                 identity_resolution_skip = None
+                if self._is_assistant_only_range(item_dict.get("ranges")):
+                    logger.warning("Skipping upsert operation for assistant-only message range")
+                    continue
                 classify_identity_fields = getattr(
                     self._isolation_handler,
                     "_classify_identity_fields",
@@ -1040,6 +1043,24 @@ class ExtractLoop:
             extract_context=self._extract_context,
         )
         return candidate_uri if candidate_uri != source_uri else source_uri
+
+    def _is_assistant_only_range(self, ranges: Any) -> bool:
+        """Return whether a message-backed operation has no user-owned messages."""
+        if ranges is None:
+            return False
+        try:
+            message_range = self._extract_context.read_message_ranges(str(ranges))
+        except Exception:
+            return False
+        messages = [
+            message
+            for message_group in getattr(message_range, "elements", []) or []
+            for message in message_group
+        ]
+        return bool(messages) and not any(
+            getattr(message, "role", None) == "user" for message in messages
+        )
+
 
     def _normalize_delete_ids(self, raw_delete_ids: List[Any]) -> List[DeleteId]:
         delete_ids: List[DeleteId] = []
