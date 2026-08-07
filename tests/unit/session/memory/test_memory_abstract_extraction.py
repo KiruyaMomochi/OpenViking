@@ -1,5 +1,6 @@
 """Regression tests for memory abstract extraction used by vector metadata."""
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -79,7 +80,9 @@ async def test_reindex_memory_regenerates_summary_abstract_from_body(monkeypatch
     monkeypatch.setattr(reindex_module, "get_viking_fs", lambda: viking_fs)
 
     executor = ReindexExecutor()
-    executor._safe_read_text = AsyncMock(return_value=body)
+    executor._read_memory_body = AsyncMock(
+        return_value=SimpleNamespace(exists=True, text=body, error=None)
+    )
     executor._best_file_summary = AsyncMock(return_value="")
     executor._fetch_existing_record = AsyncMock(
         return_value={"abstract": body, "uri": uri}
@@ -111,7 +114,9 @@ async def test_reindex_memory_prefers_overview_summary_over_stale_existing_abstr
     monkeypatch.setattr(reindex_module, "get_viking_fs", lambda: viking_fs)
 
     executor = ReindexExecutor()
-    executor._safe_read_text = AsyncMock(return_value=body)
+    executor._read_memory_body = AsyncMock(
+        return_value=SimpleNamespace(exists=True, text=body, error=None)
+    )
     executor._best_file_summary = AsyncMock(return_value="Overview summary.")
     executor._fetch_existing_record = AsyncMock(return_value={"abstract": body})
     executor._upsert_context = AsyncMock()

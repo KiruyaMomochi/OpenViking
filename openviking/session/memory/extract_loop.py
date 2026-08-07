@@ -383,6 +383,9 @@ The final output of the model must strictly follow the JSON Schema format shown 
             for item in items:
                 item_dict = dict(item)
                 item_dict["memory_type"] = memory_type
+                if self._is_assistant_only_range(item_dict.get("ranges")):
+                    logger.warning("Skipping upsert operation for assistant-only message range")
+                    continue
                 try:
                     self._isolation_handler.fill_identity_fields(
                         item_dict,
@@ -491,6 +494,23 @@ The final output of the model must strictly follow the JSON Schema format shown 
                     break
 
         return resolved, raw_links
+
+    def _is_assistant_only_range(self, ranges: Any) -> bool:
+        """Return whether a message-backed operation has no user-owned messages."""
+        if ranges is None:
+            return False
+        try:
+            message_range = self._extract_context.read_message_ranges(str(ranges))
+        except Exception:
+            return False
+        messages = [
+            message
+            for message_group in getattr(message_range, "elements", []) or []
+            for message in message_group
+        ]
+        return bool(messages) and not any(
+            getattr(message, "role", None) == "user" for message in messages
+        )
 
 
     def _normalize_delete_ids(self, raw_delete_ids: List[Any]) -> List[DeleteId]:

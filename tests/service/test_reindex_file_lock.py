@@ -9,7 +9,6 @@ from openviking.server.identity import RequestContext, Role
 from openviking.service import reindex_executor as reindex_module
 from openviking.service.reindex_executor import ReindexExecutor
 from openviking.session.memory.utils.memory_file_utils import _extract_memory_abstract
-from openviking.storage.transaction import init_lock_manager, release_all_locks, reset_lock_manager
 from openviking_cli.session.user_id import UserIdentifier
 
 
