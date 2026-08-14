@@ -10,7 +10,8 @@ from enum import Enum
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping, cast
 
-_VERSION = 1
+_VERSION = 2
+_SUPPORTED_VERSIONS = frozenset({1, 2})
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _WORDS_RE = re.compile(r"\w+", re.UNICODE)
 _GENERIC_SKIP_PHRASES = {
@@ -95,6 +96,29 @@ def _digest(value: Any, field: str) -> str:
     return value
 
 
+def _source_range(
+    start: Any,
+    end: Any,
+    *,
+    start_field: str = "range_start",
+    end_field: str = "range_end",
+) -> tuple[int | None, int | None]:
+    if start is None and end is None:
+        return None, None
+    if start is None or end is None:
+        raise CoverageError(f"{start_field} and {end_field} must be provided together")
+    if (
+        isinstance(start, bool)
+        or not isinstance(start, int)
+        or isinstance(end, bool)
+        or not isinstance(end, int)
+        or start < 0
+        or end <= start
+    ):
+        raise CoverageError("source range must contain non-negative integers with start < end")
+    return start, end
+
+
 @dataclass(frozen=True, slots=True)
 class ReviewUnit:
     unit_id: str
@@ -104,6 +128,11 @@ class ReviewUnit:
     substantive: bool = True
     content_sha256: str | None = None
     discovered_bytes: int | None = None
+    parent_unit_id: str | None = None
+    range_start: int | None = None
+    range_end: int | None = None
+    source_revision: str | None = None
+    required: bool = True
 
     def __post_init__(self) -> None:
         for field in ("unit_id", "source_id", "locator", "kind"):
@@ -120,6 +149,19 @@ class ReviewUnit:
             or self.discovered_bytes < 0
         ):
             raise CoverageError("discovered_bytes must be a non-negative integer")
+        if self.parent_unit_id is not None:
+            object.__setattr__(self, "parent_unit_id", _text(self.parent_unit_id, "parent_unit_id"))
+            if self.parent_unit_id == self.unit_id:
+                raise CoverageError("review unit hierarchy contains a cycle")
+        start, end = _source_range(self.range_start, self.range_end)
+        object.__setattr__(self, "range_start", start)
+        object.__setattr__(self, "range_end", end)
+        if self.source_revision is not None:
+            object.__setattr__(
+                self, "source_revision", _text(self.source_revision, "source_revision")
+            )
+        if not isinstance(self.required, bool):
+            raise CoverageError("required must be a boolean")
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,10 +186,34 @@ class VerifiedSummary:
         object.__setattr__(self, "membership_sha256", expected)
 
 
+def _unit_payload(unit: ReviewUnit) -> dict[str, Any]:
+    """Return the stable unit payload, omitting additive fields at their defaults."""
+
+    payload = {
+        "unit_id": unit.unit_id,
+        "source_id": unit.source_id,
+        "locator": unit.locator,
+        "kind": unit.kind,
+        "substantive": unit.substantive,
+        "content_sha256": unit.content_sha256,
+        "discovered_bytes": unit.discovered_bytes,
+    }
+    if unit.parent_unit_id is not None:
+        payload["parent_unit_id"] = unit.parent_unit_id
+    if unit.range_start is not None:
+        payload["range_start"] = unit.range_start
+        payload["range_end"] = unit.range_end
+    if unit.source_revision is not None:
+        payload["source_revision"] = unit.source_revision
+    if not unit.required:
+        payload["required"] = False
+    return payload
+
+
 def _snapshot_payload(snapshot: "CollectionSnapshot") -> dict[str, Any]:
     return {
         "source_id": snapshot.source_id,
-        "units": [asdict(unit) for unit in snapshot.units],
+        "units": [_unit_payload(unit) for unit in snapshot.units],
         "verified_summaries": [
             {**asdict(summary), "covered_unit_ids": list(summary.covered_unit_ids)}
             for summary in snapshot.verified_summaries
@@ -174,6 +240,33 @@ class CollectionSnapshot:
             raise CoverageError("collection snapshot contains duplicate unit IDs")
         if any(unit.source_id != source for unit in units):
             raise CoverageError("collection unit belongs to a different source")
+        for unit in units:
+            if unit.parent_unit_id is None:
+                continue
+            parent = by_id.get(unit.parent_unit_id)
+            if parent is None or parent.source_id != unit.source_id:
+                raise CoverageError(
+                    "parent and child units must belong to the same collection snapshot and source"
+                )
+            if parent.source_revision != unit.source_revision:
+                raise CoverageError("parent and child units must use the same source revision")
+            if (
+                parent.range_start is not None
+                and unit.range_start is not None
+                and (
+                    unit.range_start < parent.range_start
+                    or cast(int, unit.range_end) > cast(int, parent.range_end)
+                )
+            ):
+                raise CoverageError("child source range must be contained by its parent range")
+        for unit in units:
+            ancestors: set[str] = set()
+            current = unit
+            while current.parent_unit_id is not None:
+                if current.unit_id in ancestors:
+                    raise CoverageError("review unit hierarchy contains a cycle")
+                ancestors.add(current.unit_id)
+                current = by_id[current.parent_unit_id]
         seen: set[str] = set()
         for summary in summaries:
             unit = by_id.get(summary.summary_unit_id)
@@ -189,7 +282,7 @@ class CollectionSnapshot:
 
 
 def _receipt_payload(receipt: "ReadReceipt") -> dict[str, Any]:
-    return {
+    payload = {
         "snapshot_id": receipt.snapshot_id,
         "unit_id": receipt.unit_id,
         "locator": receipt.locator,
@@ -197,6 +290,12 @@ def _receipt_payload(receipt: "ReadReceipt") -> dict[str, Any]:
         "byte_count": receipt.byte_count,
         "complete": receipt.complete,
     }
+    if receipt.range_start is not None:
+        payload["range_start"] = receipt.range_start
+        payload["range_end"] = receipt.range_end
+    if receipt.source_revision is not None:
+        payload["source_revision"] = receipt.source_revision
+    return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,6 +307,9 @@ class ReadReceipt:
     byte_count: int
     complete: bool
     receipt_id: str = ""
+    range_start: int | None = None
+    range_end: int | None = None
+    source_revision: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "snapshot_id", _digest(self.snapshot_id, "snapshot_id"))
@@ -218,6 +320,13 @@ class ReadReceipt:
             raise CoverageError("byte_count must be an integer")
         if self.byte_count < 0 or not isinstance(self.complete, bool):
             raise CoverageError("invalid read receipt length or completeness")
+        start, end = _source_range(self.range_start, self.range_end)
+        object.__setattr__(self, "range_start", start)
+        object.__setattr__(self, "range_end", end)
+        if self.source_revision is not None:
+            object.__setattr__(
+                self, "source_revision", _text(self.source_revision, "source_revision")
+            )
         expected = _sha256(_receipt_payload(self))
         if self.receipt_id and self.receipt_id != expected:
             raise CoverageError("read receipt digest does not match")
@@ -243,6 +352,9 @@ class ReadReceipt:
             hashlib.sha256(raw).hexdigest(),
             len(raw),
             complete,
+            range_start=unit.range_start,
+            range_end=unit.range_end,
+            source_revision=unit.source_revision,
         )
 
 
@@ -286,6 +398,19 @@ class CoverageLedger:
         self._snapshot_by_unit = {
             unit.unit_id: snapshot for snapshot in self._snapshots for unit in snapshot.units
         }
+        children: dict[str, list[str]] = {unit_id: [] for unit_id in self._units}
+        self._parents: dict[str, str] = {}
+        for unit in self._units.values():
+            if unit.parent_unit_id is None:
+                continue
+            parent = self._units.get(unit.parent_unit_id)
+            if parent is None or parent.source_id != unit.source_id:
+                raise CoverageError("parent and child units must belong to the same source")
+            if self._snapshot_by_unit[parent.unit_id] is not self._snapshot_by_unit[unit.unit_id]:
+                raise CoverageError("parent and child units must belong to the same snapshot")
+            children[parent.unit_id].append(unit.unit_id)
+            self._parents[unit.unit_id] = parent.unit_id
+        self._children = {unit_id: tuple(items) for unit_id, items in children.items()}
         self._summaries = {
             summary.summary_unit_id: summary
             for snapshot in self._snapshots
@@ -344,13 +469,80 @@ class CoverageLedger:
     def receipt(self, unit_id: str) -> ReadReceipt | None:
         return self._state(unit_id).receipt
 
+    def _required_children(self, unit_id: str) -> tuple[str, ...]:
+        return tuple(
+            child_id for child_id in self._children[unit_id] if self._units[child_id].required
+        )
+
+    def _children_cover_range(self, unit_id: str, children: tuple[str, ...]) -> bool:
+        parent = self._units[unit_id]
+        if parent.range_start is None:
+            return True
+        if not children or any(self._units[item].range_start is None for item in children):
+            return False
+        cursor = parent.range_start
+        for child_id in sorted(children, key=lambda item: cast(int, self._units[item].range_start)):
+            child = self._units[child_id]
+            child_start = cast(int, child.range_start)
+            child_end = cast(int, child.range_end)
+            if child_start > cursor:
+                return False
+            cursor = max(cursor, child_end)
+            if cursor >= cast(int, parent.range_end):
+                return True
+        return False
+
+    def _derived_parent_status(self, unit_id: str) -> CoverageStatus:
+        required_children = self._required_children(unit_id)
+        if not required_children or not self._children_cover_range(unit_id, required_children):
+            return CoverageStatus.PENDING
+        statuses = tuple(self._states[item].status for item in required_children)
+        if CoverageStatus.PENDING in statuses:
+            return CoverageStatus.PENDING
+        if all(status == CoverageStatus.SKIPPED for status in statuses):
+            return CoverageStatus.SKIPPED
+        if any(status in {CoverageStatus.REVIEWED, CoverageStatus.COVERED} for status in statuses):
+            return CoverageStatus.COVERED
+        return CoverageStatus.PENDING
+
+    def _refresh_ancestors(self, unit_id: str, iteration: int | None) -> None:
+        parent_id = self._parents.get(unit_id)
+        while parent_id is not None:
+            state = self._states[parent_id]
+            desired = self._derived_parent_status(parent_id)
+            if state.status != desired:
+                self._states[parent_id] = (
+                    _State()
+                    if desired == CoverageStatus.PENDING
+                    else _State(desired, transition_iteration=iteration)
+                )
+            parent_id = self._parents.get(parent_id)
+
+    def _reject_containers(self, unit_ids: Iterable[str], action: str) -> None:
+        containers = [item for item in unit_ids if self._children[item]]
+        if containers:
+            raise CoverageError(
+                f"parent containers cannot be directly {action}: {', '.join(containers)}"
+            )
+
     def _validate_receipt(self, receipt: ReadReceipt) -> tuple[ReviewUnit, _State]:
         if not isinstance(receipt, ReadReceipt) or receipt.unit_id not in self._units:
             raise CoverageError("receipt references an unknown unit")
         unit = self._units[receipt.unit_id]
+        self._reject_containers((unit.unit_id,), "receipted")
         snapshot = self._snapshot_by_unit[unit.unit_id]
         if receipt.snapshot_id != snapshot.snapshot_id or receipt.locator != unit.locator:
             raise CoverageError("receipt does not match the collection snapshot")
+        if (
+            receipt.range_start != unit.range_start
+            or receipt.range_end != unit.range_end
+            or receipt.source_revision != unit.source_revision
+        ):
+            raise CoverageError("receipt does not match the unit source range or revision")
+        if unit.range_start is not None and receipt.byte_count != (
+            cast(int, unit.range_end) - unit.range_start
+        ):
+            raise CoverageError("receipt byte_count does not match the unit source range")
         if not receipt.complete:
             raise CoverageError("partial reads do not count as reviewed")
         if receipt.byte_count <= 0:
@@ -364,9 +556,7 @@ class CoverageLedger:
         if state.status == CoverageStatus.SKIPPED and state.harness_non_substantive:
             raise CoverageError(f"cannot review harness-classified unit {unit.unit_id!r}")
         credited_iteration = (
-            state.transition_iteration
-            if state.status == CoverageStatus.REVIEWED
-            else iteration
+            state.transition_iteration if state.status == CoverageStatus.REVIEWED else iteration
         )
         state.status, state.receipt, state.covered_by, state.skip_reason = (
             CoverageStatus.REVIEWED,
@@ -376,6 +566,7 @@ class CoverageLedger:
         )
         state.transition_iteration = credited_iteration
         state.harness_non_substantive = False
+        self._refresh_ancestors(unit.unit_id, credited_iteration)
 
     def mark_reviewed(
         self,
@@ -441,6 +632,7 @@ class CoverageLedger:
         ]
         if blocked:
             raise CoverageError(f"verified summary cannot cover skipped units: {blocked}")
+        self._reject_containers(summary.covered_unit_ids, "covered")
         self.record_read(receipt, iteration=iteration)
         return self.cover(summary.covered_unit_ids, summary_unit_id, iteration=iteration)
 
@@ -464,6 +656,7 @@ class CoverageLedger:
             raise CoverageError(f"summary {summary_unit_id!r} does not verify members: {outside}")
         if blocked:
             raise CoverageError(f"verified summary cannot cover skipped units: {blocked}")
+        self._reject_containers(unit_ids, "covered")
         changed = tuple(
             item for item in unit_ids if self._states[item].status == CoverageStatus.PENDING
         )
@@ -471,6 +664,8 @@ class CoverageLedger:
             self._states[item].status = CoverageStatus.COVERED
             self._states[item].covered_by = summary_unit_id
             self._states[item].transition_iteration = iteration
+        for item in changed:
+            self._refresh_ancestors(item, iteration)
         return changed
 
     def skip(
@@ -481,6 +676,7 @@ class CoverageLedger:
         iteration: int | None = None,
     ) -> None:
         unit_ids, reason = self._ids(unit_ids), _skip_reason(reason)
+        self._reject_containers(unit_ids, "skipped")
         if any(
             self._states[item].status in {CoverageStatus.REVIEWED, CoverageStatus.COVERED}
             for item in unit_ids
@@ -492,6 +688,7 @@ class CoverageLedger:
                 skip_reason=reason,
                 transition_iteration=iteration,
             )
+            self._refresh_ancestors(item, iteration)
 
     def mark_harness_non_substantive(
         self,
@@ -508,9 +705,9 @@ class CoverageLedger:
         """
 
         unit_ids, reason = self._ids(unit_ids), _skip_reason(reason)
+        self._reject_containers(unit_ids, "classified non-substantive")
         if any(
-            self._states[item].status
-            not in {CoverageStatus.PENDING, CoverageStatus.SKIPPED}
+            self._states[item].status not in {CoverageStatus.PENDING, CoverageStatus.SKIPPED}
             for item in unit_ids
         ):
             raise CoverageError("only pending or skipped units can be classified non-substantive")
@@ -523,6 +720,7 @@ class CoverageLedger:
                 transition_iteration=iteration,
                 harness_non_substantive=True,
             )
+            self._refresh_ancestors(item, iteration)
 
     @staticmethod
     def _visible_state(state: _State, before_iteration: int | None) -> _State:
@@ -539,12 +737,17 @@ class CoverageLedger:
             item: self._visible_state(state, before_iteration)
             for item, state in self._states.items()
         }
-        pending = [item for item, state in visible.items() if state.status == "pending"]
+        pending = [
+            item
+            for item, state in visible.items()
+            if self._units[item].required and state.status == CoverageStatus.PENDING
+        ]
         issues = [f"pending review units: {', '.join(pending)}"] if pending else []
         awaiting_delivery = [
             item
             for item, state in self._states.items()
             if before_iteration is not None
+            and self._units[item].required
             and state.transition_iteration is not None
             and state.transition_iteration >= before_iteration
         ]
@@ -557,11 +760,13 @@ class CoverageLedger:
             substantive_units = [
                 unit
                 for unit in snapshot.units
-                if unit.substantive
+                if unit.required
+                and unit.substantive
                 and not visible[unit.unit_id].harness_non_substantive
             ]
             if substantive_units and not any(
-                unit.substantive
+                unit.required
+                and unit.substantive
                 and not visible[unit.unit_id].harness_non_substantive
                 and visible[unit.unit_id].status
                 in {CoverageStatus.REVIEWED, CoverageStatus.COVERED}
@@ -593,14 +798,16 @@ class CoverageLedger:
                     "snapshot_id": snapshot.snapshot_id,
                     "counts": self._counts(unit.unit_id for unit in snapshot.units),
                     "has_substantive_evidence": any(
-                        unit.substantive
+                        unit.required
+                        and unit.substantive
                         and not self._states[unit.unit_id].harness_non_substantive
                         and self._states[unit.unit_id].status
                         in {CoverageStatus.REVIEWED, CoverageStatus.COVERED}
                         for unit in snapshot.units
                     )
                     or not any(
-                        unit.substantive
+                        unit.required
+                        and unit.substantive
                         and not self._states[unit.unit_id].harness_non_substantive
                         for unit in snapshot.units
                     ),
@@ -638,11 +845,7 @@ class CoverageLedger:
                         if state.transition_iteration is not None
                         else {}
                     ),
-                    **(
-                        {"harness_non_substantive": True}
-                        if state.harness_non_substantive
-                        else {}
-                    ),
+                    **({"harness_non_substantive": True} if state.harness_non_substantive else {}),
                 }
                 for unit_id, state in self._states.items()
             },
@@ -650,7 +853,12 @@ class CoverageLedger:
 
     @classmethod
     def from_internal_dict(cls, value: Mapping[str, Any]) -> "CoverageLedger":
-        if value.get("version") != _VERSION or not isinstance(value.get("states"), Mapping):
+        version = value.get("version")
+        if (
+            isinstance(version, bool)
+            or version not in _SUPPORTED_VERSIONS
+            or not isinstance(value.get("states"), Mapping)
+        ):
             raise CoverageError("unsupported or invalid coverage serialization")
         snapshots = []
         for raw in value.get("snapshots", []):
@@ -705,6 +913,25 @@ class CoverageLedger:
 
     def _validate_states(self) -> None:
         for unit_id, state in self._states.items():
+            if self._children[unit_id]:
+                expected = self._derived_parent_status(unit_id)
+                if state.status != expected:
+                    raise CoverageError(
+                        f"parent unit {unit_id!r} does not match its child coverage states"
+                    )
+                if any(
+                    (
+                        state.receipt,
+                        state.covered_by,
+                        state.skip_reason,
+                        state.harness_non_substantive,
+                    )
+                ) or (
+                    state.status == CoverageStatus.PENDING
+                    and state.transition_iteration is not None
+                ):
+                    raise CoverageError(f"parent unit {unit_id!r} contains direct evidence")
+                continue
             if state.status == CoverageStatus.PENDING and any(
                 (
                     state.receipt,
@@ -734,9 +961,7 @@ class CoverageLedger:
             ):
                 raise CoverageError(f"skipped unit {unit_id!r} has invalid evidence")
             if state.harness_non_substantive and state.status != CoverageStatus.SKIPPED:
-                raise CoverageError(
-                    f"non-substantive unit {unit_id!r} must be recorded as skipped"
-                )
+                raise CoverageError(f"non-substantive unit {unit_id!r} must be recorded as skipped")
 
     def _state(self, unit_id: str) -> _State:
         try:

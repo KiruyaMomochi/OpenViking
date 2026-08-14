@@ -186,6 +186,154 @@ async def test_vlm_adapter_preserves_dashscope_thinking(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_vlm_adapter_nonstream_overrides_configured_max_tokens():
+    captured = {}
+
+    class FakeVLM:
+        thinking = True
+
+        async def get_completion_async(self, **kwargs):
+            captured.update(kwargs)
+            return "ok"
+
+    provider = VLMProviderAdapter(
+        FakeVLM(),
+        default_model="ep-test",
+        langfuse_client=SimpleNamespace(enabled=False, _client=None),
+    )
+
+    response = await provider.chat_with_thinking(
+        messages=[{"role": "user", "content": "hi"}],
+        max_tokens=321,
+        thinking=False,
+    )
+
+    assert response.content == "ok"
+    assert captured["max_tokens"] == 321
+    assert captured["thinking"] is False
+
+
+@pytest.mark.asyncio
+async def test_volcengine_nonstream_call_uses_call_max_tokens_over_config(monkeypatch):
+    from openviking.models.vlm.backends.volcengine_vlm import VolcEngineVLM
+
+    captured = {}
+
+    class FakeCompletions:
+        async def create(self, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content="ok", tool_calls=None),
+                        finish_reason="stop",
+                    )
+                ],
+                usage=None,
+            )
+
+    vlm = VolcEngineVLM(
+        {
+            "api_key": "ak-test",
+            "model": "ep-test",
+            "max_tokens": 16384,
+        }
+    )
+    monkeypatch.setattr(
+        vlm,
+        "get_async_client",
+        lambda: SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions())),
+    )
+
+    result = await vlm.get_completion_async(
+        messages=[{"role": "user", "content": "hi"}],
+        thinking=False,
+        max_tokens=2400,
+    )
+
+    assert result == "ok"
+    assert captured["max_tokens"] == 2400
+    assert captured["thinking"] == {"type": "disabled"}
+
+
+@pytest.mark.asyncio
+async def test_volcengine_empty_tools_preserves_length_finish_reason(monkeypatch):
+    from openviking.models.vlm.backends.volcengine_vlm import VolcEngineVLM
+
+    class FakeCompletions:
+        async def create(self, **_kwargs):
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content="truncated", tool_calls=None),
+                        finish_reason="length",
+                    )
+                ],
+                usage=None,
+            )
+
+    vlm = VolcEngineVLM({"api_key": "ak-test", "model": "ep-test"})
+    monkeypatch.setattr(
+        vlm,
+        "get_async_client",
+        lambda: SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions())),
+    )
+    provider = VLMProviderAdapter(
+        vlm,
+        default_model="ep-test",
+        langfuse_client=SimpleNamespace(enabled=False, _client=None),
+    )
+
+    response = await provider.chat_with_thinking(
+        messages=[{"role": "user", "content": "hi"}],
+        tools=[],
+        max_tokens=512,
+        thinking=False,
+    )
+
+    assert response.content == "truncated"
+    assert response.finish_reason == "length"
+
+
+@pytest.mark.asyncio
+async def test_litellm_empty_tools_preserves_length_finish_reason(monkeypatch):
+    from openviking.models.vlm.backends.litellm_vlm import LiteLLMVLMProvider
+
+    async def fake_acompletion(**_kwargs):
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content="truncated", tool_calls=None),
+                    finish_reason="length",
+                )
+            ],
+            usage=None,
+        )
+
+    monkeypatch.setattr(
+        "openviking.models.vlm.backends.litellm_vlm.acompletion",
+        fake_acompletion,
+    )
+    provider = VLMProviderAdapter(
+        LiteLLMVLMProvider(
+            {"provider": "dashscope", "model": "qwen-plus", "api_key": "sk-test"}
+        ),
+        default_model="qwen-plus",
+        langfuse_client=SimpleNamespace(enabled=False, _client=None),
+    )
+
+    response = await provider.chat_with_thinking(
+        messages=[{"role": "user", "content": "hi"}],
+        tools=[],
+        max_tokens=512,
+        thinking=False,
+    )
+
+    assert response.content == "truncated"
+    assert response.finish_reason == "length"
+
+
+@pytest.mark.asyncio
 async def test_litellm_bot_provider_does_not_send_thinking_to_generic_openai(monkeypatch):
     captured = {}
 

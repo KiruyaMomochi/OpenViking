@@ -7,6 +7,8 @@ Provides file system operations: ls, mkdir, rm, mv, tree, stat, read, abstract, 
 """
 
 import asyncio
+import hashlib
+import json
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from openviking.core.namespace import classify_uri, context_type_for_uri
@@ -29,10 +31,27 @@ from openviking.telemetry import get_current_telemetry
 from openviking.telemetry.request_wait_tracker import get_request_wait_tracker
 from openviking.telemetry.resource_summary import build_queue_status_payload
 from openviking.utils.embedding_utils import vectorize_directory_meta
-from openviking_cli.exceptions import DeadlineExceededError, NotInitializedError
+from openviking_cli.exceptions import (
+    ConflictError,
+    DeadlineExceededError,
+    InvalidArgumentError,
+    NotInitializedError,
+)
 from openviking_cli.utils import VikingURI, get_logger
 
 logger = get_logger(__name__)
+
+MAX_BYTE_RANGE_SIZE = 16 * 1024 * 1024
+
+
+def _byte_range_revision(stat: Dict[str, Any]) -> str:
+    """Return the stable revision token used by byte-range reads."""
+    payload = json.dumps(
+        [stat.get("size"), stat.get("modTime")],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _may_include_memory_content(uri: str) -> bool:
@@ -641,6 +660,58 @@ class FSService:
         viking_fs = self._ensure_initialized()
         uri = validate_viking_uri(uri)
         return await viking_fs.read_file_bytes(uri, ctx=ctx)
+
+    async def read_range(
+        self,
+        uri: str,
+        ctx: RequestContext,
+        offset: int = 0,
+        size: int = MAX_BYTE_RANGE_SIZE,
+        expected_revision: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Read one bounded byte range without materializing the whole file."""
+        if offset < 0:
+            raise InvalidArgumentError("offset must be greater than or equal to 0")
+        if size < 1 or size > MAX_BYTE_RANGE_SIZE:
+            raise InvalidArgumentError(f"size must be between 1 and {MAX_BYTE_RANGE_SIZE} bytes")
+
+        viking_fs = self._ensure_initialized()
+        uri = validate_viking_uri(uri)
+        before = await viking_fs.stat(uri, ctx=ctx)
+        if before.get("isDir", False):
+            raise InvalidArgumentError(
+                f"Cannot read directory as file: {uri}",
+                details={"resource": uri, "expected": "file", "actual": "directory"},
+            )
+        revision = _byte_range_revision(before)
+        if expected_revision is not None and expected_revision != revision:
+            raise ConflictError("File revision does not match expected revision", resource=uri)
+        total_size_before = int(before.get("size", 0))
+        if offset > total_size_before:
+            raise InvalidArgumentError(
+                f"offset {offset} is beyond the file size {total_size_before}"
+            )
+
+        content = await viking_fs.read(uri, offset, size, ctx)
+        if len(content) > size:
+            raise InvalidArgumentError("storage returned more bytes than the requested range")
+
+        after = await viking_fs.stat(uri, ctx=ctx)
+        if _byte_range_revision(after) != revision:
+            raise ConflictError("File changed while reading byte range", resource=uri)
+
+        total_size = int(after.get("size", 0))
+        end = offset + len(content)
+        eof = end >= total_size
+        return {
+            "content": bytes(content),
+            "start": offset,
+            "end": end,
+            "next_offset": None if eof else end,
+            "eof": eof,
+            "total_size": total_size,
+            "revision": revision,
+        }
 
     async def write(
         self,

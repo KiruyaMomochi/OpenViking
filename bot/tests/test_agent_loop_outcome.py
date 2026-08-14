@@ -1,3 +1,4 @@
+import asyncio
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -39,6 +40,18 @@ class _RecordingProvider(LLMProvider):
 
     def get_default_model(self) -> str:
         return "fake-model"
+
+
+class _SlowThenFastProvider(_RecordingProvider):
+    def __init__(self):
+        super().__init__()
+        self.thinking_modes = []
+
+    async def chat_with_thinking(self, *, thinking=None, **kwargs):
+        self.thinking_modes.append(thinking)
+        if thinking is None:
+            await asyncio.Event().wait()
+        return LLMResponse(content="fallback")
 
 
 class _FakeLangfuseClient:
@@ -104,6 +117,37 @@ def test_agents_config_enables_subagents_by_default():
 
 def test_agents_config_keeps_ten_recent_openviking_messages_by_default():
     assert AgentsConfig().commit_keep_recent_count == 10
+
+
+@pytest.mark.asyncio
+async def test_structured_model_call_times_out_then_retries_without_thinking(
+    temp_dir: Path, monkeypatch
+):
+    monkeypatch.setattr(AgentLoop, "_register_builtin_hooks", lambda self: None)
+    monkeypatch.setattr(AgentLoop, "_register_default_tools", lambda self: None)
+    monkeypatch.setattr("vikingbot.agent.loop.SubagentManager", _FakeSubagentManager)
+    provider = _SlowThenFastProvider()
+    loop = AgentLoop(
+        bus=MessageBus(),
+        provider=provider,
+        workspace=temp_dir / "workspace",
+        config=Config(storage_workspace=str(temp_dir)),
+    )
+
+    response, streamed_content, streamed_reasoning = (
+        await loop._chat_structured_with_timeout_fallback(
+            messages=[{"role": "user", "content": "compile"}],
+            tools=[],
+            session_key=SessionKey(type="compile", channel_id="c", chat_id="c"),
+            thinking_timeout_seconds=0.01,
+            fallback_timeout_seconds=1,
+        )
+    )
+
+    assert response.content == "fallback"
+    assert provider.thinking_modes == [None, False]
+    assert streamed_content is False
+    assert streamed_reasoning is False
 
 
 def test_agent_loop_omits_spawn_tool_when_subagents_disabled(temp_dir: Path, monkeypatch):

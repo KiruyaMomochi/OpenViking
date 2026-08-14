@@ -427,7 +427,7 @@ class LiteLLMVLMProvider(VLMBase):
             elapsed = time.perf_counter() - t0
             self._update_token_usage_from_response(response, duration_seconds=elapsed)
             tracer.info(f"response={response}")
-            if tools:
+            if tools is not None:
                 return self._build_vlm_response(response, has_tools=True)
             return self._clean_response(self._extract_content_from_response(response))
 
@@ -446,9 +446,12 @@ class LiteLLMVLMProvider(VLMBase):
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_choice: Optional[str] = None,
         messages: Optional[List[Dict[str, Any]]] = None,
+        max_tokens: Optional[int] = None,
     ) -> Union[str, VLMResponse]:
         """Get text completion asynchronously."""
         kwargs = self._build_text_kwargs(prompt, thinking, tools, tool_choice, messages)
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max_tokens
         # 用 tracer.info 打印请求
         tracer.info(
             f"request: {json.dumps(redact_image_data_urls(kwargs), ensure_ascii=False, indent=2)}"
@@ -460,7 +463,7 @@ class LiteLLMVLMProvider(VLMBase):
             elapsed = time.perf_counter() - t0
             self._update_token_usage_from_response(response, duration_seconds=elapsed)
             tracer.info(f"response={response}")
-            if tools:
+            if tools is not None:
                 return self._build_vlm_response(response, has_tools=True)
             return self._clean_response(self._extract_content_from_response(response))
 

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0
 """VLM base interface and abstract classes"""
 
+import inspect
 import logging
 import re
 from abc import ABC, abstractmethod
@@ -21,6 +22,30 @@ from .token_usage import TokenUsageTracker
 
 _THINK_TAG_RE = re.compile(r"<think>[\s\S]*?</think>")
 logger = get_logger(__name__)
+
+
+def _call_kwargs(method: Callable[..., Any], kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """Drop additive optional kwargs unsupported by an older wrapped backend."""
+
+    if kwargs.get("max_tokens") is None:
+        kwargs = {key: value for key, value in kwargs.items() if key != "max_tokens"}
+    if "max_tokens" not in kwargs:
+        return kwargs
+    try:
+        parameters = inspect.signature(method).parameters.values()
+    except (TypeError, ValueError):
+        return {key: value for key, value in kwargs.items() if key != "max_tokens"}
+    if any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        or parameter.name == "max_tokens"
+        for parameter in parameters
+    ):
+        return kwargs
+    logger.warning(
+        "Wrapped VLM method %s does not support per-call max_tokens; using its configured limit",
+        getattr(method, "__qualname__", repr(method)),
+    )
+    return {key: value for key, value in kwargs.items() if key != "max_tokens"}
 
 
 class UnsupportedMediaInputError(RuntimeError):
@@ -112,6 +137,7 @@ class VLMBase(ABC):
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_choice: Optional[str] = None,
         messages: Optional[List[Dict[str, Any]]] = None,
+        max_tokens: Optional[int] = None,
     ) -> Union[str, VLMResponse]:
         """Get text completion asynchronously
 
@@ -484,7 +510,7 @@ class FailoverVLM(VLMBase):
         if self._switcher.should_try_primary():
             try:
                 method = getattr(self.primary, method_name)
-                result = await method(*args, **kwargs)
+                result = await method(*args, **_call_kwargs(method, kwargs))
                 self._switcher.record_primary_success()
                 return result
             except Exception as e:
@@ -501,7 +527,7 @@ class FailoverVLM(VLMBase):
         try:
             self._switcher.record_backup_request()
             method = getattr(self.backup, method_name)
-            return await method(*args, **kwargs)
+            return await method(*args, **_call_kwargs(method, kwargs))
         except Exception as e:
             _annotate_vlm_error(e, self.backup)
             last_error = e
@@ -572,6 +598,7 @@ class FailoverVLM(VLMBase):
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_choice: Optional[str] = None,
         messages: Optional[List[Dict[str, Any]]] = None,
+        max_tokens: Optional[int] = None,
     ) -> Union[str, VLMResponse]:
         """Get text completion asynchronously with failover support."""
         return await self._get_completion_with_failover_async(
@@ -581,6 +608,7 @@ class FailoverVLM(VLMBase):
             tools=tools,
             tool_choice=tool_choice,
             messages=messages,
+            max_tokens=max_tokens,
         )
 
     def get_vision_completion(
@@ -860,7 +888,7 @@ class MultiCredentialVLM(VLMBase):
 
             try:
                 method = getattr(vlm_instance, method_name)
-                result = await method(*args, **kwargs)
+                result = await method(*args, **_call_kwargs(method, kwargs))
                 self._switcher.commit_success(idx)
                 return result
             except Exception as exc:
@@ -946,6 +974,7 @@ class MultiCredentialVLM(VLMBase):
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_choice: Optional[str] = None,
         messages: Optional[List[Dict[str, Any]]] = None,
+        max_tokens: Optional[int] = None,
     ) -> Union[str, VLMResponse]:
         """Get text completion asynchronously with multi-credential failover support."""
         return await self._get_completion_with_failover_async(
@@ -955,6 +984,7 @@ class MultiCredentialVLM(VLMBase):
             tools=tools,
             tool_choice=tool_choice,
             messages=messages,
+            max_tokens=max_tokens,
         )
 
     def get_vision_completion(

@@ -28,10 +28,56 @@ class _FakeVLM:
         return self.result
 
 
+class _StrictLegacyVLM:
+    thinking = False
+
+    async def get_completion_async(
+        self,
+        prompt="",
+        thinking=False,
+        tools=None,
+        tool_choice=None,
+        messages=None,
+    ):
+        del prompt, thinking, tools, tool_choice, messages
+        return "legacy-ok"
+
+
 class _FakeVolcEngineFailoverVLM(_FakeVLM):
     provider = "volcengine"
     model = "primary-model"
     thinking = False
+
+
+@pytest.mark.asyncio
+async def test_chat_keeps_strict_legacy_vlm_call_shape_without_limit():
+    adapter = VLMProviderAdapter(
+        _StrictLegacyVLM(),
+        "test-model",
+        langfuse_client=_DisabledLangfuse(),
+    )
+
+    response = await adapter.chat(messages=[{"role": "user", "content": "hello"}])
+
+    assert response.content == "legacy-ok"
+    assert response.finish_reason == "stop"
+
+
+@pytest.mark.asyncio
+async def test_chat_degrades_cleanly_when_legacy_vlm_lacks_call_limit():
+    adapter = VLMProviderAdapter(
+        _StrictLegacyVLM(),
+        "test-model",
+        langfuse_client=_DisabledLangfuse(),
+    )
+
+    response = await adapter.chat(
+        messages=[{"role": "user", "content": "hello"}],
+        max_tokens=512,
+    )
+
+    assert response.content == "legacy-ok"
+    assert response.finish_reason == "stop"
 
 
 class _AsyncChunks:

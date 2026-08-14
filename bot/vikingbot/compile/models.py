@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Literal
 
@@ -20,6 +22,26 @@ OKF_VERSION = "0.1"
 TERMINAL_STATUSES = frozenset({"completed", "partial", "incomplete", "failed"})
 
 
+@dataclass(frozen=True, slots=True)
+class CompileReviewView:
+    """Harness-owned content view bound to exact coverage units."""
+
+    content: str | Callable[[], Awaitable[str]]
+    bound_unit_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.content, str) and not callable(self.content):
+            raise TypeError("review view content must be text or an async loader")
+        unit_ids = tuple(self.bound_unit_ids)
+        if (
+            not unit_ids
+            or len(unit_ids) != len(set(unit_ids))
+            or not all(isinstance(unit_id, str) and unit_id.strip() for unit_id in unit_ids)
+        ):
+            raise ValueError("review view must bind unique non-empty unit IDs")
+        object.__setattr__(self, "bound_unit_ids", unit_ids)
+
+
 class CompileLimits(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -36,6 +58,20 @@ class CompileLimits(BaseModel):
     tool_result_bytes: int = 1024 * 1024
     tool_total_result_bytes: int = 8 * 1024 * 1024
     adapted_input_bytes: int = 32 * 1024 * 1024
+    source_range_bytes: int = 8 * 1024 * 1024
+    source_total_io_bytes: int = 2 * 1024 * 1024 * 1024
+    source_max_record_bytes: int = 32 * 1024 * 1024
+    source_packet_chars: int = 240_000
+    source_max_packets: int = 512
+    source_map_calls: int = 128
+    source_map_input_chars: int = 12_000_000
+    source_map_output_chars: int = 1024 * 1024
+    source_map_concurrency: int = 4
+    source_map_timeout_seconds: float = 45
+    source_map_max_tokens: int = 512
+    agent_context_tokens: int = 112_000
+    agent_thinking_timeout_seconds: float = 60
+    agent_fallback_timeout_seconds: float = 120
     output_pages: int = 128
     output_files: int = 128
     output_operations: int = 256
@@ -96,13 +132,14 @@ class WikiPageDraft(BaseModel):
         description=(
             "Inline Markdown body for an actual Wiki page. Link relevant known source "
             "URIs with ordinary Markdown links; never invent link targets."
-        )
+        ),
     )
     body_workspace_path: str | None = Field(
         default=None,
         description=(
             f"Relative path under {COMPILE_WIKI_PAGE_ROOT}/ for a generated "
-            "UTF-8 Markdown Wiki body."
+            "UTF-8 Markdown Wiki body. For a new page, this path's suffix is "
+            "also its default target path."
         ),
     )
     source_ids: list[str] = Field(
@@ -112,8 +149,9 @@ class WikiPageDraft(BaseModel):
     path_hint: str | None = Field(
         default=None,
         description=(
-            "Optional relative path for a new Wiki page. Omit by default so its filename "
-            "derives from title; use only for Skill-required paths and avoid generic basenames."
+            "Optional explicit target-path override for a new Wiki page. A staged page "
+            f"defaults to its path under {COMPILE_WIKI_PAGE_ROOT}/; an inline page "
+            "defaults to a filename derived from title."
         ),
     )
     update_uri: str | None = None
@@ -121,9 +159,7 @@ class WikiPageDraft(BaseModel):
     @model_validator(mode="after")
     def validate_body(self) -> "WikiPageDraft":
         if (self.body_markdown is None) == (self.body_workspace_path is None):
-            raise ValueError(
-                "exactly one of body_markdown or body_workspace_path is required"
-            )
+            raise ValueError("exactly one of body_markdown or body_workspace_path is required")
         return self
 
 
@@ -163,9 +199,7 @@ class WikiBundleDraft(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     pages: list[WikiPageDraft] = Field(
-        description=(
-            "Actual Wiki pages only; do not place Skill-prescribed artifact files here."
-        )
+        description=("Actual Wiki pages only; do not place Skill-prescribed artifact files here.")
     )
     files: list[CompileFileDraft] = Field(
         default_factory=list,
@@ -281,6 +315,7 @@ __all__ = [
     "CompileIncomplete",
     "CompileLimits",
     "CompileRequest",
+    "CompileReviewView",
     "CompileResult",
     "CompileTask",
     "DEFAULT_COMPILE_REASON",

@@ -19,12 +19,14 @@ from vikingbot.compile.coverage import (
 from vikingbot.compile.models import (
     CompileIncomplete,
     CompileLimits,
+    CompileReviewView,
     CompileTask,
     SanitizedCompileRequest,
     WikiBundleDraft,
     utc_now,
 )
 from vikingbot.compile.service import BotCompileService
+from vikingbot.providers.base import LLMResponse
 
 
 class _ReadTool(Tool):
@@ -80,6 +82,196 @@ def _scoped(
     )
 
 
+class _ContextClient:
+    def __init__(self, root: str, files: dict[str, bytes]):
+        self.client = self
+        self.root = root
+        self.files = files
+        self.range_calls = []
+        self.raw_calls = []
+
+    async def overview(self, uri):
+        assert uri == self.root
+        return "Source overview"
+
+    async def list_resources(self, *, path, recursive, node_limit, show_all_hidden=False):
+        assert path == self.root
+        assert node_limit > 0
+        if not recursive:
+            assert show_all_hidden is True
+        return [
+            {
+                "uri": locator,
+                "name": locator.rsplit("/", 1)[-1],
+                "isDir": False,
+                "size": len(content),
+            }
+            for locator, content in self.files.items()
+        ]
+
+    async def read_range(
+        self,
+        locator,
+        offset=0,
+        size=16 * 1024 * 1024,
+        expected_revision=None,
+    ):
+        content = self.files[locator]
+        revision = f"revision-{len(content)}"
+        assert expected_revision in {None, revision}
+        self.range_calls.append((locator, offset, size, expected_revision))
+        chunk = content[offset : offset + size]
+        end = offset + len(chunk)
+        return SimpleNamespace(
+            content=chunk,
+            start=offset,
+            end=end,
+            next_offset=None if end >= len(content) else end,
+            eof=end >= len(content),
+            total_size=len(content),
+            revision=revision,
+        )
+
+    async def read_raw(self, locator):
+        self.raw_calls.append(locator)
+        return self.files[locator].decode()
+
+
+class _MapProvider:
+    def __init__(self):
+        self.calls = []
+
+    async def chat(self, **kwargs):
+        self.calls.append(kwargs)
+        return LLMResponse(content="bounded faithful source summary")
+
+
+@pytest.mark.asyncio
+async def test_large_source_uses_stream_map_then_summary_delivery_covers_ranges(tmp_path):
+    root = "viking://resources/source"
+    locator = f"{root}/large.txt"
+    client = _ContextClient(root, {locator: ("important fact\n" * 100).encode()})
+    provider = _MapProvider()
+    service = BotCompileService(
+        agent_loop=SimpleNamespace(config=SimpleNamespace(bot_data_path=tmp_path)),
+        limits=CompileLimits(
+            tool_result_bytes=512,
+            tool_total_result_bytes=1024,
+            source_range_bytes=32,
+            source_total_io_bytes=10_000,
+            source_max_record_bytes=1000,
+            source_packet_chars=80,
+            source_max_packets=100,
+            source_map_calls=10,
+            source_map_input_chars=100_000,
+            source_map_output_chars=10_000,
+            source_map_timeout_seconds=1,
+            source_map_max_tokens=100,
+        ),
+    )
+
+    context = await service._build_source_context(
+        client,
+        [root],
+        reason="Compile facts",
+        skill_contract="Write a report",
+        provider=provider,
+        model="map",
+        session_id="cmp_large",
+    )
+
+    assert context.large_mode is True
+    assert client.range_calls
+    assert client.raw_calls == []
+    assert provider.calls
+    assert context.sources[0]["verified_summary_views"] == list(context.review_views)
+    reader = CompileScopedTool(
+        _ReadTool("openviking_multi_read"),
+        roots=(root,),
+        limits=service.limits,
+        result_budget={"bytes": 0},
+        budget_lock=asyncio.Lock(),
+        coverage=context.coverage,
+        review_views=context.review_views,
+    )
+    result = await reader.execute(
+        ToolContext(iteration=1),
+        uris=list(context.review_views),
+    )
+
+    assert "bounded faithful source summary" in result
+    assert context.coverage.gate_error(before_iteration=1)
+    assert context.coverage.gate_error(before_iteration=2) is None
+
+
+@pytest.mark.asyncio
+async def test_small_source_keeps_fast_path_without_range_or_map_calls(tmp_path):
+    root = "viking://resources/source"
+    locator = f"{root}/small.md"
+    client = _ContextClient(root, {locator: b"small body"})
+    provider = _MapProvider()
+    service = BotCompileService(
+        agent_loop=SimpleNamespace(config=SimpleNamespace(bot_data_path=tmp_path))
+    )
+
+    context = await service._build_source_context(
+        client,
+        [root],
+        provider=provider,
+        model="map",
+    )
+
+    assert context.large_mode is False
+    assert client.range_calls == []
+    assert client.raw_calls == []
+    assert provider.calls == []
+    assert context.review_views == {}
+
+
+@pytest.mark.asyncio
+async def test_unknown_inventory_size_selects_large_range_path(tmp_path):
+    root = "viking://resources/source"
+    locator = f"{root}/unknown.txt"
+
+    class UnknownSizeClient(_ContextClient):
+        async def list_resources(
+            self, *, path, recursive, node_limit, show_all_hidden=False
+        ):
+            assert path == self.root
+            assert node_limit > 0
+            if not recursive:
+                assert show_all_hidden is True
+            return [{"uri": locator, "name": "unknown.txt", "isDir": False}]
+
+    client = UnknownSizeClient(root, {locator: b"source with unknown inventory size"})
+    provider = _MapProvider()
+    service = BotCompileService(
+        agent_loop=SimpleNamespace(config=SimpleNamespace(bot_data_path=tmp_path)),
+        limits=CompileLimits(
+            source_range_bytes=8,
+            source_total_io_bytes=1024,
+            source_packet_chars=32,
+            source_map_calls=10,
+            source_map_input_chars=100_000,
+            source_map_output_chars=10_000,
+            source_map_timeout_seconds=1,
+            source_map_max_tokens=100,
+        ),
+    )
+
+    context = await service._build_source_context(
+        client,
+        [root],
+        provider=provider,
+        model="map",
+    )
+
+    assert context.large_mode is True
+    assert client.range_calls
+    assert provider.calls
+    assert context.review_views
+
+
 @pytest.mark.asyncio
 async def test_multiple_sources_leave_submission_blocked_when_one_is_unread(tmp_path):
     roots = ("viking://resources/one", "viking://resources/two")
@@ -93,9 +285,7 @@ async def test_multiple_sources_leave_submission_blocked_when_one_is_unread(tmp_
         async def overview(self, uri):
             return f"Overview of {uri}"
 
-        async def list_resources(
-            self, *, path, recursive, node_limit, show_all_hidden=False
-        ):
+        async def list_resources(self, *, path, recursive, node_limit, show_all_hidden=False):
             assert node_limit > 0
             if not recursive:
                 assert show_all_hidden is True
@@ -161,9 +351,7 @@ async def test_same_iteration_read_cannot_race_submission_gate():
     assert same_turn_submit.startswith("Error: Coverage gate rejected")
     assert "not usable until its tool result is delivered" in same_turn_submit
     assert submit.candidate_coverage_issue is not None
-    next_turn_submit = await submit.execute(
-        ToolContext(iteration=2, iteration_limit=10), pages=[]
-    )
+    next_turn_submit = await submit.execute(ToolContext(iteration=2, iteration_limit=10), pages=[])
     assert next_turn_submit.startswith("Wiki bundle accepted")
     assert submit.candidate_coverage_issue is None
 
@@ -177,6 +365,8 @@ async def test_harness_verified_empty_adapter_unit_is_skipped_only_after_deliver
     async def empty_codex_view():
         return ""
 
+    review_view = CompileReviewView(empty_codex_view, ("codex",))
+
     blocked_tool = CompileScopedTool(
         _ReadTool("openviking_multi_read"),
         roots=("viking://resources/source",),
@@ -184,11 +374,9 @@ async def test_harness_verified_empty_adapter_unit_is_skipped_only_after_deliver
         result_budget={"bytes": 0},
         budget_lock=asyncio.Lock(),
         coverage=ledger,
-        review_views={uri: empty_codex_view},
+        review_views={uri: review_view},
     )
-    blocked = await blocked_tool.execute(
-        ToolContext(iteration=1, iteration_limit=10), uris=[uri]
-    )
+    blocked = await blocked_tool.execute(ToolContext(iteration=1, iteration_limit=10), uris=[uri])
 
     assert blocked == "Error: Compile task tool-result budget exceeded."
     assert ledger.status("codex") == CoverageStatus.PENDING
@@ -200,11 +388,9 @@ async def test_harness_verified_empty_adapter_unit_is_skipped_only_after_deliver
         result_budget={"bytes": 0},
         budget_lock=asyncio.Lock(),
         coverage=ledger,
-        review_views={uri: empty_codex_view},
+        review_views={uri: review_view},
     )
-    result = await tool.execute(
-        ToolContext(iteration=2, iteration_limit=10), uris=[uri]
-    )
+    result = await tool.execute(ToolContext(iteration=2, iteration_limit=10), uris=[uri])
 
     assert "no substantive Codex conversation content" in result
     assert ledger.status("codex") == CoverageStatus.SKIPPED
@@ -233,12 +419,10 @@ async def test_harness_empty_adapter_read_upgrades_an_agent_skip():
         result_budget={"bytes": 0},
         budget_lock=asyncio.Lock(),
         coverage=ledger,
-        review_views={uri: empty_codex_view},
+        review_views={uri: CompileReviewView(empty_codex_view, ("codex",))},
     )
 
-    result = await tool.execute(
-        ToolContext(iteration=2, iteration_limit=10), uris=[uri]
-    )
+    result = await tool.execute(ToolContext(iteration=2, iteration_limit=10), uris=[uri])
 
     assert "no substantive Codex conversation content" in result
     assert ledger.status("codex") == CoverageStatus.SKIPPED
@@ -274,7 +458,7 @@ async def test_discovered_large_unit_is_rejected_before_underlying_read():
 
 
 @pytest.mark.asyncio
-async def test_adapted_batch_stops_before_accumulating_oversized_combined_result():
+async def test_adapted_batch_preserves_each_item_when_combined_result_is_oversized():
     first_uri = "viking://resources/source/one.jsonl"
     second_uri = "viking://resources/source/two.jsonl"
     units = (
@@ -295,18 +479,86 @@ async def test_adapted_batch_stops_before_accumulating_oversized_combined_result
     tool = CompileScopedTool(
         _ReadTool("openviking_multi_read"),
         roots=("viking://resources/source",),
-        limits=CompileLimits(tool_result_bytes=100),
+        limits=CompileLimits(tool_result_bytes=280),
         result_budget={"bytes": 0},
         budget_lock=asyncio.Lock(),
         coverage=ledger,
-        review_views={first_uri: first_view, second_uri: second_view},
+        review_views={
+            first_uri: CompileReviewView(first_view, ("one",)),
+            second_uri: CompileReviewView(second_view, ("two",)),
+        },
     )
 
     result = await tool.execute(ToolContext(), uris=[first_uri, second_uri])
 
-    assert result == "Error: Compile tool result exceeds the per-call size limit."
-    assert calls == ["one"]
-    assert ledger.summary()["counts"]["reviewed"] == 0
+    assert "a" * 40 in result
+    assert "item omitted because a delivery budget was exhausted" in result
+    assert calls == ["one", "two"]
+    assert ledger.status("one") == CoverageStatus.REVIEWED
+    assert ledger.status("two") == CoverageStatus.PENDING
+
+
+@pytest.mark.asyncio
+async def test_delegated_batch_records_fitting_items_when_one_item_is_oversized():
+    first_uri = "viking://resources/source/first.md"
+    second_uri = "viking://resources/source/second.md"
+    units = (
+        ReviewUnit("first", "src_1", first_uri),
+        ReviewUnit("second", "src_1", second_uri),
+    )
+    ledger = CoverageLedger((CollectionSnapshot("src_1", units),))
+    tool = _scoped(
+        _ReadTool(
+            "openviking_multi_read",
+            {first_uri: "a" * 200, second_uri: "kept"},
+        ),
+        ledger,
+        ("viking://resources/source",),
+        limits=CompileLimits(tool_result_bytes=240),
+    )
+
+    result = await tool.execute(ToolContext(iteration=1), uris=[first_uri, second_uri])
+
+    assert "item omitted because a delivery budget was exhausted" in result
+    assert "kept" in result
+    assert ledger.status("first") == CoverageStatus.PENDING
+    assert ledger.status("second") == CoverageStatus.REVIEWED
+
+
+@pytest.mark.asyncio
+async def test_multi_read_isolates_one_item_exception_and_reviews_later_item():
+    first_uri = "viking://resources/source/broken.md"
+    second_uri = "viking://resources/source/good.md"
+    ledger = CoverageLedger(
+        (
+            CollectionSnapshot(
+                "src_1",
+                (
+                    ReviewUnit("broken", "src_1", first_uri),
+                    ReviewUnit("good", "src_1", second_uri),
+                ),
+            ),
+        )
+    )
+
+    class SometimesRaises(_ReadTool):
+        async def execute(self, tool_context, **kwargs):
+            if kwargs["uris"] == [first_uri]:
+                raise RuntimeError("source temporarily unavailable")
+            return await super().execute(tool_context, **kwargs)
+
+    tool = _scoped(
+        SometimesRaises("openviking_multi_read", {second_uri: "good body"}),
+        ledger,
+        ("viking://resources/source",),
+    )
+
+    result = await tool.execute(ToolContext(iteration=1), uris=[first_uri, second_uri])
+
+    assert "source temporarily unavailable" in result
+    assert "good body" in result
+    assert ledger.status("broken") == CoverageStatus.PENDING
+    assert ledger.status("good") == CoverageStatus.REVIEWED
 
 
 @pytest.mark.asyncio
@@ -343,12 +595,8 @@ async def test_source_inventory_walks_beyond_depth_three_and_includes_hidden_fil
             {"uri": f"{root}/.private.md", "name": ".private.md", "isDir": False},
             {"uri": f"{root}/one", "name": "one", "isDir": True},
         ],
-        f"{root}/one": [
-            {"uri": f"{root}/one/two", "name": "two", "isDir": True}
-        ],
-        f"{root}/one/two": [
-            {"uri": f"{root}/one/two/three", "name": "three", "isDir": True}
-        ],
+        f"{root}/one": [{"uri": f"{root}/one/two", "name": "two", "isDir": True}],
+        f"{root}/one/two": [{"uri": f"{root}/one/two/three", "name": "three", "isDir": True}],
         f"{root}/one/two/three": [
             {"uri": f"{root}/one/two/three/four", "name": "four", "isDir": True}
         ],
@@ -371,9 +619,7 @@ async def test_source_inventory_walks_beyond_depth_three_and_includes_hidden_fil
         async def overview(self, uri):
             return f"Overview of {uri}"
 
-        async def list_resources(
-            self, *, path, recursive, node_limit, show_all_hidden=False
-        ):
+        async def list_resources(self, *, path, recursive, node_limit, show_all_hidden=False):
             assert node_limit > 0
             if recursive:
                 return []
@@ -598,10 +844,61 @@ async def test_multi_read_isolates_each_uri_from_forged_section_markers():
 
 
 @pytest.mark.asyncio
-async def test_verified_summary_read_can_cover_members_and_unlock_submission():
+async def test_virtual_review_view_cannot_receipt_real_unit_with_colliding_locator():
+    locator = "viking://resources/source/doc.compile-summary-collision.md"
+    body = "Harness summary content"
+    member = ReviewUnit("member", "src_1", "viking://resources/source/original.md")
     summary = ReviewUnit(
-        "summary", "src_1", "viking://resources/source/summary.md", kind="summary"
+        "summary",
+        "src_1",
+        locator,
+        kind="summary",
+        discovered_bytes=len(body.encode()),
+        required=False,
     )
+    physical = ReviewUnit(
+        "physical",
+        "src_2",
+        locator,
+        discovered_bytes=len(body.encode()),
+    )
+    ledger = CoverageLedger(
+        (
+            CollectionSnapshot(
+                "src_1",
+                (member, summary),
+                (VerifiedSummary("summary", ("member",), "harness-v1"),),
+            ),
+            CollectionSnapshot("src_2", (physical,)),
+        )
+    )
+
+    class MustNotRead(_ReadTool):
+        async def execute(self, tool_context, **kwargs):
+            raise AssertionError(f"virtual view delegated a physical read: {tool_context}, {kwargs}")
+
+    reader = CompileScopedTool(
+        MustNotRead("openviking_multi_read"),
+        roots=("viking://resources/source",),
+        limits=CompileLimits(),
+        result_budget={"bytes": 0},
+        budget_lock=asyncio.Lock(),
+        coverage=ledger,
+        review_views={locator: CompileReviewView(body, ("summary",))},
+    )
+
+    result = await reader.execute(ToolContext(iteration=1), uris=[locator])
+
+    assert body in result
+    assert ledger.status("summary") == CoverageStatus.REVIEWED
+    assert ledger.status("member") == CoverageStatus.COVERED
+    assert ledger.status("physical") == CoverageStatus.PENDING
+    assert ledger.is_complete() is False
+
+
+@pytest.mark.asyncio
+async def test_verified_summary_read_can_cover_members_and_unlock_submission():
+    summary = ReviewUnit("summary", "src_1", "viking://resources/source/summary.md", kind="summary")
     first = ReviewUnit("first", "src_1", "viking://resources/source/first.md")
     second = ReviewUnit("second", "src_1", "viking://resources/source/second.md")
     snapshot = CollectionSnapshot(

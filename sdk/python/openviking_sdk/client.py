@@ -7,9 +7,10 @@ import os
 import tempfile
 import uuid
 import zipfile
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Union
 from urllib.parse import quote
 
 import httpx
@@ -66,6 +67,60 @@ ERROR_CODE_TO_EXCEPTION = {
 GATEWAY_MARKER_HEADER = "X-VikingBot-Gateway"
 GATEWAY_TOKEN_HEADER = "X-Gateway-Token"
 _SESSION_CONFIG_UNSET = object()
+MAX_BYTE_RANGE_SIZE = 16 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class RangeRead:
+    """Raw bytes and exclusive-offset metadata returned by ``read_range``."""
+
+    content: bytes
+    start: int
+    end: int
+    next_offset: Optional[int]
+    eof: bool
+    total_size: int
+    revision: str
+
+
+def _response_header(headers: Mapping[str, str], name: str) -> Optional[str]:
+    """Read a response header from either httpx.Headers or a plain mapping."""
+    value = headers.get(name)
+    if value is not None:
+        return str(value)
+    lowered = name.lower()
+    for key, candidate in headers.items():
+        if str(key).lower() == lowered:
+            return str(candidate)
+    return None
+
+
+def _response_header_int(
+    headers: Mapping[str, str],
+    name: str,
+    default: int,
+) -> int:
+    value = _response_header(headers, name)
+    try:
+        return int(value) if value not in (None, "") else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _response_header_bool(
+    headers: Mapping[str, str],
+    name: str,
+    default: bool,
+) -> bool:
+    value = _response_header(headers, name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes"}:
+        return True
+    if normalized in {"0", "false", "no"}:
+        return False
+    return default
 
 
 def _image_mime_type(file_name: str = "") -> str:
@@ -401,9 +456,7 @@ class AsyncHTTPClient:
         self._ldap_username = config.ldap_username
         self._ldap_password = config.ldap_password
         self._oidc_token = config.oidc_token
-        self._event_hooks = {
-            event: list(hooks) for event, hooks in (event_hooks or {}).items()
-        }
+        self._event_hooks = {event: list(hooks) for event, hooks in (event_hooks or {}).items()}
         self._http: Optional[httpx.AsyncClient] = None
         self._observer: Optional[_HTTPObserver] = None
         self._snapshot: Optional["AsyncHTTPSnapshotNamespace"] = None
@@ -422,6 +475,7 @@ class AsyncHTTPClient:
         # LDAP Basic Auth
         if self._auth_mode == "ldap" and self._ldap_username and self._ldap_password:
             from .config import get_basic_auth_header
+
             headers["Authorization"] = get_basic_auth_header(
                 self._ldap_username, self._ldap_password
             )
@@ -1137,6 +1191,49 @@ class AsyncHTTPClient:
             },
         )
         return self._handle_response(response)
+
+    async def read_range(
+        self,
+        uri: str,
+        offset: int = 0,
+        size: int = MAX_BYTE_RANGE_SIZE,
+        expected_revision: Optional[str] = None,
+    ) -> RangeRead:
+        """Read at most 16 MiB of raw file bytes starting at ``offset``."""
+        params: Dict[str, Any] = {
+            "uri": VikingURI.normalize(uri),
+            "offset": offset,
+            "size": size,
+        }
+        if expected_revision is not None:
+            params["expected_revision"] = expected_revision
+        response = await self._request("GET", "/api/v1/content/range", params=params)
+        if not response.is_success:
+            self._handle_response_data(response)
+
+        content = bytes(response.content)
+        headers = response.headers
+        start = _response_header_int(headers, "X-OpenViking-Start", offset)
+        end = _response_header_int(headers, "X-OpenViking-End", start + len(content))
+        total_size = _response_header_int(headers, "X-OpenViking-Total-Size", end)
+        eof = _response_header_bool(headers, "X-OpenViking-EOF", end >= total_size)
+        raw_next_offset = _response_header(headers, "X-OpenViking-Next-Offset")
+        if raw_next_offset in (None, ""):
+            next_offset = None if eof else end
+        else:
+            try:
+                next_offset = int(raw_next_offset)
+            except (TypeError, ValueError):
+                next_offset = None if eof else end
+        return RangeRead(
+            content=content,
+            start=start,
+            end=end,
+            next_offset=next_offset,
+            eof=eof,
+            total_size=total_size,
+            revision=_response_header(headers, "X-OpenViking-Revision") or "",
+        )
 
     async def download_bytes(self, uri: str) -> bytes:
         """Download an OpenViking file without interpreting its contents."""
@@ -2227,6 +2324,22 @@ class SyncHTTPClient:
     def read_raw(self, uri: str, offset: int = 0, limit: int = -1) -> str:
         return run_async(self._async_client.read_raw(uri, offset=offset, limit=limit))
 
+    def read_range(
+        self,
+        uri: str,
+        offset: int = 0,
+        size: int = MAX_BYTE_RANGE_SIZE,
+        expected_revision: Optional[str] = None,
+    ) -> RangeRead:
+        return run_async(
+            self._async_client.read_range(
+                uri,
+                offset=offset,
+                size=size,
+                expected_revision=expected_revision,
+            )
+        )
+
     def download_bytes(self, uri: str) -> bytes:
         return run_async(self._async_client.download_bytes(uri))
 
@@ -2846,9 +2959,7 @@ class SyncHTTPSnapshotNamespace:
         from_ref: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Compare one file between two snapshot refs."""
-        return run_async(
-            self._ns().diff(path, from_ref=from_ref, to_ref=to_ref)
-        )
+        return run_async(self._ns().diff(path, from_ref=from_ref, to_ref=to_ref))
 
     def get_gitignore(self) -> str:
         return run_async(self._ns().get_gitignore())

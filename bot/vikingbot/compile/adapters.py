@@ -10,7 +10,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, Protocol
 
 from vikingbot.compile.coverage import CollectionSnapshot, ReviewUnit
 
@@ -44,12 +44,31 @@ _KNOWN_ROLLOUT_TYPES = frozenset(
         "world_state",
     }
 )
+_STRUCTURAL_ROLLOUT_TYPES = frozenset(
+    {
+        "image_generation_end",
+        "patch_apply_end",
+        "thread_settings_applied",
+        "tool_search_end",
+        "tool_search_start",
+        "web_search_end",
+    }
+)
 _SAFE_RESPONSE_ITEM_TYPES = frozenset(
     {
+        "compaction",
+        "customtoolcall",
+        "customtoolcalloutput",
+        "encryptedcontent",
         "functioncall",
         "functioncalloutput",
-        "local_shell_call",
+        "imagegenerationcall",
+        "imagegenerationoutput",
+        "inputimage",
+        "localshellcall",
         "reasoning",
+        "toolsearchcall",
+        "toolsearchoutput",
         "websearchcall",
     }
 )
@@ -60,16 +79,28 @@ _SAFE_EVENT_TYPES = frozenset(
         "execapprovalrequest",
         "execcommandbegin",
         "execcommandend",
+        "imagegenerationend",
+        "mcptoolcallend",
         "mcpstartupcomplete",
+        "patchapplyend",
+        "taskcomplete",
         "taskstarted",
+        "threadsettingsapplied",
+        "threadrolledback",
         "tokencount",
+        "toolsearchend",
+        "toolsearchstart",
         "turnaborted",
         "turncomplete",
+        "websearchend",
     }
 )
 _SAFE_COMPLETED_ITEM_TYPES = frozenset(
     {"commandexecution", "filechange", "mcptoolcall", "reasoning", "todoupdate", "websearch"}
 )
+_SAFE_NON_TEXT_BLOCK_TYPES = frozenset({"encryptedcontent", "image", "inputimage", "outputimage"})
+
+RecordDisposition = Literal["emitted", "structural", "duplicate", "unsupported"]
 
 
 class AdapterError(ValueError):
@@ -134,8 +165,314 @@ class _ParsedLine:
 
 
 @dataclass(frozen=True, slots=True)
+class StreamRecord:
+    """One fully consumed source record and its deterministic adapter disposition."""
+
+    line_number: int
+    start: int
+    end: int
+    content_sha256: str
+    disposition: RecordDisposition
+    messages: tuple[ReviewMessage, ...] = ()
+    record_type: str | None = None
+    warning: str | None = None
+    opaque_excerpt: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class StreamAdaptation:
+    adapter_id: str
+    thread_id: str
+    records: tuple[StreamRecord, ...]
+
+    @property
+    def warnings(self) -> tuple[str, ...]:
+        return tuple(record.warning for record in self.records if record.warning)
+
+    @property
+    def messages(self) -> tuple[ReviewMessage, ...]:
+        return tuple(message for record in self.records for message in record.messages)
+
+    @property
+    def dispositions(self) -> dict[RecordDisposition, int]:
+        result: dict[RecordDisposition, int] = {
+            "emitted": 0,
+            "structural": 0,
+            "duplicate": 0,
+            "unsupported": 0,
+        }
+        for record in self.records:
+            result[record.disposition] += 1
+        return result
+
+    def render(self) -> str:
+        view = ReviewView(
+            unit_id=f"codex::{self.thread_id}",
+            session_id=self.thread_id,
+            messages=self.messages,
+        )
+        return view.render() if view.messages else ""
+
+    def render_with_unsupported(self) -> str:
+        """Render a complete bounded review view without whole-file fallback.
+
+        Known control/tool records stay structurally filtered.  Unknown or
+        malformed records are retained in source order as opaque data, so one
+        schema addition cannot discard valid messages around it.
+        """
+
+        sections: list[str] = []
+        for record in self.records:
+            sections.extend(
+                f"[{message.role.upper()}]\n{message.text}" for message in record.messages
+            )
+            if record.disposition == "unsupported":
+                sections.append(
+                    "\n".join(
+                        (
+                            "[UNSUPPORTED SOURCE RECORD "
+                            f"line={record.line_number} bytes=[{record.start},{record.end})]",
+                            record.opaque_excerpt or record.warning or "[opaque record]",
+                        )
+                    )
+                )
+        return "\n\n".join(sections) + ("\n" if sections else "")
+
+
+class SourceAdapter(Protocol):
+    adapter_id: str
+
+    def is_candidate_path(self, path: str | Path) -> bool: ...
+
+    def stream_decoder(
+        self,
+        path: str | Path,
+        *,
+        max_record_bytes: int = 32 * 1024 * 1024,
+        opaque_excerpt_chars: int = 4096,
+    ) -> "CodexRolloutStreamDecoder": ...
+
+
+class AdapterRegistry:
+    """Small format registry; selection is based on format probes, never Skill names."""
+
+    def __init__(self, adapters: Iterable[SourceAdapter] | None = None):
+        self._adapters = tuple(adapters or (CodexRolloutAdapter(),))
+
+    def candidate(self, path: str | Path) -> SourceAdapter | None:
+        return next(
+            (adapter for adapter in self._adapters if adapter.is_candidate_path(path)),
+            None,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class _PathIdentity:
     thread_id: str
+
+
+class CodexRolloutStreamDecoder:
+    """Incrementally decode a Codex JSONL rollout without materializing the file.
+
+    The decoder owns only the unfinished JSONL record.  Unknown records are
+    surfaced as bounded opaque evidence instead of invalidating already parsed
+    messages or triggering a complete-raw fallback.
+    """
+
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        max_record_bytes: int = 32 * 1024 * 1024,
+        opaque_excerpt_chars: int = 4096,
+    ):
+        identity = _codex_path_identity(path)
+        if identity is None:
+            raise AdapterError("path is not a canonical Codex rollout")
+        if isinstance(max_record_bytes, bool) or max_record_bytes <= 0:
+            raise AdapterError("max_record_bytes must be a positive integer")
+        if isinstance(opaque_excerpt_chars, bool) or opaque_excerpt_chars < 0:
+            raise AdapterError("opaque_excerpt_chars must be a non-negative integer")
+        self.path = str(path)
+        self.thread_id = identity.thread_id
+        self.max_record_bytes = int(max_record_bytes)
+        self.opaque_excerpt_chars = int(opaque_excerpt_chars)
+        self._buffer = bytearray()
+        self._buffer_start = 0
+        self._line_number = 0
+        self._meta: Mapping[str, Any] | None = None
+        self._child_session = False
+        self._last_message: tuple[str, str] | None = None
+        self._finished = False
+
+    def feed(self, chunk: bytes | bytearray | memoryview) -> tuple[StreamRecord, ...]:
+        if self._finished:
+            raise AdapterError("cannot feed a finished Codex rollout decoder")
+        raw = bytes(chunk)
+        if raw:
+            self._buffer.extend(raw)
+        records: list[StreamRecord] = []
+        while True:
+            newline_at = self._buffer.find(b"\n")
+            if newline_at < 0:
+                break
+            line_size = newline_at + 1
+            if line_size > self.max_record_bytes:
+                raise AdapterError(f"Codex rollout record exceeds {self.max_record_bytes} bytes")
+            line = bytes(self._buffer[:line_size])
+            del self._buffer[:line_size]
+            records.append(self._consume_line(line, self._buffer_start))
+            self._buffer_start += line_size
+        if len(self._buffer) > self.max_record_bytes:
+            raise AdapterError(f"Codex rollout record exceeds {self.max_record_bytes} bytes")
+        return tuple(records)
+
+    def finish(self) -> tuple[StreamRecord, ...]:
+        if self._finished:
+            return ()
+        self._finished = True
+        records: list[StreamRecord] = []
+        if self._buffer:
+            if len(self._buffer) > self.max_record_bytes:
+                raise AdapterError(f"Codex rollout record exceeds {self.max_record_bytes} bytes")
+            line = bytes(self._buffer)
+            self._buffer.clear()
+            records.append(self._consume_line(line, self._buffer_start))
+            self._buffer_start += len(line)
+        if self._meta is None:
+            raise AdapterError("rollout is empty")
+        return tuple(records)
+
+    def _consume_line(self, raw_line: bytes, start: int) -> StreamRecord:
+        self._line_number += 1
+        end = start + len(raw_line)
+        digest = hashlib.sha256(raw_line).hexdigest()
+        payload = raw_line.rstrip(b"\r\n")
+        try:
+            text = payload.decode("utf-8")
+        except UnicodeDecodeError:
+            return self._unsupported(
+                start=start,
+                end=end,
+                digest=digest,
+                warning=f"invalid UTF-8 rollout record at line {self._line_number}",
+                excerpt=payload.decode("utf-8", errors="replace"),
+            )
+        if not text.strip():
+            return StreamRecord(
+                line_number=self._line_number,
+                start=start,
+                end=end,
+                content_sha256=digest,
+                disposition="structural",
+            )
+        try:
+            decoded = json.loads(text)
+        except json.JSONDecodeError as exc:
+            return self._unsupported(
+                start=start,
+                end=end,
+                digest=digest,
+                warning=(f"invalid JSON rollout record at line {self._line_number}: {exc.msg}"),
+                excerpt=text,
+            )
+        if not isinstance(decoded, Mapping):
+            return self._unsupported(
+                start=start,
+                end=end,
+                digest=digest,
+                warning=f"non-object rollout record at line {self._line_number}",
+                excerpt=text,
+            )
+        record_type = decoded.get("type")
+        record_type_text = record_type if isinstance(record_type, str) else None
+        if self._meta is None:
+            meta = _session_meta(decoded, expected_thread_id=self.thread_id)
+            if meta is None:
+                raise AdapterError("first rollout record is not matching Codex session_meta")
+            self._meta = meta
+            self._child_session = _is_subagent_session(meta)
+            return StreamRecord(
+                line_number=self._line_number,
+                start=start,
+                end=end,
+                content_sha256=digest,
+                disposition="structural",
+                record_type="session_meta",
+            )
+        if record_type_text in _STRUCTURAL_ROLLOUT_TYPES:
+            return StreamRecord(
+                line_number=self._line_number,
+                start=start,
+                end=end,
+                content_sha256=digest,
+                disposition="structural",
+                record_type=record_type_text,
+            )
+        if record_type_text not in _KNOWN_ROLLOUT_TYPES:
+            return self._unsupported(
+                start=start,
+                end=end,
+                digest=digest,
+                warning=(f"unknown rollout type {record_type_text!r} at line {self._line_number}"),
+                excerpt=text,
+                record_type=record_type_text,
+            )
+        try:
+            messages = _messages_from_record(decoded, child_session=self._child_session)
+        except AdapterError as exc:
+            return self._unsupported(
+                start=start,
+                end=end,
+                digest=digest,
+                warning=f"unsafe rollout record at line {self._line_number}: {exc}",
+                excerpt=text,
+                record_type=record_type_text,
+            )
+        emitted: list[ReviewMessage] = []
+        for message in messages:
+            key = (message.role, message.text)
+            if key == self._last_message:
+                continue
+            emitted.append(message)
+            self._last_message = key
+        disposition: RecordDisposition
+        if emitted:
+            disposition = "emitted"
+        elif messages:
+            disposition = "duplicate"
+        else:
+            disposition = "structural"
+        return StreamRecord(
+            line_number=self._line_number,
+            start=start,
+            end=end,
+            content_sha256=digest,
+            disposition=disposition,
+            messages=tuple(emitted),
+            record_type=record_type_text,
+        )
+
+    def _unsupported(
+        self,
+        *,
+        start: int,
+        end: int,
+        digest: str,
+        warning: str,
+        excerpt: str,
+        record_type: str | None = None,
+    ) -> StreamRecord:
+        return StreamRecord(
+            line_number=self._line_number,
+            start=start,
+            end=end,
+            content_sha256=digest,
+            disposition="unsupported",
+            record_type=record_type,
+            warning=warning,
+            opaque_excerpt=excerpt[: self.opaque_excerpt_chars] or None,
+        )
 
 
 class CodexRolloutAdapter:
@@ -147,6 +484,42 @@ class CodexRolloutAdapter:
     """
 
     adapter_id = _CODEX_ADAPTER_ID
+
+    def stream_decoder(
+        self,
+        path: str | Path,
+        *,
+        max_record_bytes: int = 32 * 1024 * 1024,
+        opaque_excerpt_chars: int = 4096,
+    ) -> CodexRolloutStreamDecoder:
+        return CodexRolloutStreamDecoder(
+            path,
+            max_record_bytes=max_record_bytes,
+            opaque_excerpt_chars=opaque_excerpt_chars,
+        )
+
+    def adapt_stream(
+        self,
+        *,
+        path: str | Path,
+        chunks: Iterable[bytes | bytearray | memoryview],
+        max_record_bytes: int = 32 * 1024 * 1024,
+        opaque_excerpt_chars: int = 4096,
+    ) -> StreamAdaptation:
+        decoder = self.stream_decoder(
+            path,
+            max_record_bytes=max_record_bytes,
+            opaque_excerpt_chars=opaque_excerpt_chars,
+        )
+        records: list[StreamRecord] = []
+        for chunk in chunks:
+            records.extend(decoder.feed(chunk))
+        records.extend(decoder.finish())
+        return StreamAdaptation(
+            adapter_id=self.adapter_id,
+            thread_id=decoder.thread_id,
+            records=tuple(records),
+        )
 
     def is_candidate_path(self, path: str | Path) -> bool:
         """Cheap path-only prefilter; ``probe`` remains the strict recognizer."""
@@ -377,6 +750,8 @@ def _extract_messages(
         if not isinstance(record_type, str):
             warnings.append(f"ignored untyped rollout record at line {parsed_line.line_number}")
             continue
+        if record_type in _STRUCTURAL_ROLLOUT_TYPES:
+            continue
         if record_type not in _KNOWN_ROLLOUT_TYPES:
             warnings.append(
                 f"ignored unknown rollout type {record_type!r} at line {parsed_line.line_number}"
@@ -419,9 +794,7 @@ def _messages_from_record(
             for item in replacement_history:
                 if not isinstance(item, Mapping):
                     raise AdapterError("compacted replacement item is not an object")
-                messages.extend(
-                    _messages_from_response_item(item, child_session=child_session)
-                )
+                messages.extend(_messages_from_response_item(item, child_session=child_session))
         summary = _plain_text(payload.get("message"))
         if summary:
             messages.append(
@@ -522,6 +895,8 @@ def _content_text(content: Any) -> str | None:
         if not isinstance(item, Mapping):
             raise AdapterError("message content contains a non-object block")
         block_type = _normalized_tag(item.get("type"))
+        if block_type in _SAFE_NON_TEXT_BLOCK_TYPES:
+            continue
         if block_type not in {"inputtext", "outputtext", "text"}:
             raise AdapterError(f"unknown message content block type {block_type!r}")
         text = _plain_text(item.get("text"))
@@ -558,7 +933,13 @@ __all__ = [
     "AdaptedCollection",
     "AdapterError",
     "AdapterProbe",
+    "AdapterRegistry",
     "CodexRolloutAdapter",
+    "CodexRolloutStreamDecoder",
+    "RecordDisposition",
     "ReviewMessage",
     "ReviewView",
+    "SourceAdapter",
+    "StreamAdaptation",
+    "StreamRecord",
 ]

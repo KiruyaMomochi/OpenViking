@@ -12,6 +12,7 @@ from openviking.core.peer_id import normalize_peer_id
 from vikingbot.config.loader import load_config
 
 if TYPE_CHECKING:
+    from openviking_cli.client._http_compat import RangeRead
     from vikingbot.config.schema import Config
 
 viking_resource_prefix = "viking://resources/"
@@ -619,6 +620,20 @@ class VikingClient:
     async def read_raw(self, uri: str, offset: int = 0, limit: int = -1) -> str:
         return await self.client.read_raw(uri, offset=offset, limit=limit)
 
+    async def read_range(
+        self,
+        uri: str,
+        offset: int = 0,
+        size: int = 16 * 1024 * 1024,
+        expected_revision: Optional[str] = None,
+    ) -> "RangeRead":
+        return await self.client.read_range(
+            uri,
+            offset=offset,
+            size=size,
+            expected_revision=expected_revision,
+        )
+
     async def download_bytes(self, uri: str) -> bytes:
         return await self.client.download_bytes(uri)
 
@@ -1042,11 +1057,7 @@ class VikingClient:
                         "tool_input": tool_input,
                         "tool_output": result_str,
                         "tool_status": explicit_status
-                        or (
-                            "completed"
-                            if tool_info.get("execute_success", True)
-                            else "error"
-                        ),
+                        or ("completed" if tool_info.get("execute_success", True) else "error"),
                         "skill_uri": skill_uri,
                         "duration_ms": float(tool_info.get("duration", 0.0) or 0.0),
                         "prompt_tokens": tool_info.get("input_token"),

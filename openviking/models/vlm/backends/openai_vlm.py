@@ -329,11 +329,17 @@ class OpenAIVLM(VLMBase):
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_choice: Optional[str] = None,
         messages: Optional[List[Dict[str, Any]]] = None,
+        max_tokens: Optional[int] = None,
     ) -> Union[str, VLMResponse]:
         """Get text completion asynchronously"""
         effective_thinking = self.thinking if thinking is None else thinking
         client = self.get_async_client()
         kwargs = self._build_text_kwargs(prompt, tools, tool_choice, messages, effective_thinking)
+        if max_tokens is not None:
+            token_key = "max_completion_tokens" if _is_reasoning_model(kwargs["model"]) else "max_tokens"
+            kwargs.pop("max_tokens", None)
+            kwargs.pop("max_completion_tokens", None)
+            kwargs[token_key] = max_tokens
 
         async def _call() -> Union[str, VLMResponse]:
             t0 = time.perf_counter()

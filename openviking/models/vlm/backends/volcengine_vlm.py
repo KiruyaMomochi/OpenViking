@@ -178,8 +178,8 @@ class VolcEngineVLM(OpenAIVLM):
         response = client.chat.completions.create(**kwargs)
         elapsed = time.perf_counter() - t0
         self._update_token_usage_from_response(response, duration_seconds=elapsed)
-        result = self._build_vlm_response(response, has_tools=bool(tools))
-        if tools:
+        result = self._build_vlm_response(response, has_tools=tools is not None)
+        if tools is not None:
             return result
         return self._clean_response(str(result))
 
@@ -191,6 +191,7 @@ class VolcEngineVLM(OpenAIVLM):
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_choice: Optional[str] = None,
         messages: Optional[List[Dict[str, Any]]] = None,
+        max_tokens: Optional[int] = None,
     ) -> Union[str, VLMResponse]:
         """Get text completion asynchronously via Chat Completions API."""
         effective_thinking = self.thinking if thinking is None else thinking
@@ -202,8 +203,9 @@ class VolcEngineVLM(OpenAIVLM):
             "thinking": {"type": "disabled" if not effective_thinking else "enabled"},
             "extra_headers": self.extra_headers,
         }
-        if self.max_tokens is not None:
-            kwargs["max_tokens"] = self.max_tokens
+        effective_max_tokens = self.max_tokens if max_tokens is None else max_tokens
+        if effective_max_tokens is not None:
+            kwargs["max_tokens"] = effective_max_tokens
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice or "auto"
@@ -227,8 +229,8 @@ class VolcEngineVLM(OpenAIVLM):
                 response = await client.chat.completions.create(**kwargs)
                 elapsed = time.perf_counter() - t0
                 self._update_token_usage_from_response(response, duration_seconds=elapsed)
-                result = self._build_vlm_response(response, has_tools=bool(tools))
-                if tools:
+                result = self._build_vlm_response(response, has_tools=tools is not None)
+                if tools is not None:
                     return result
                 content = self._clean_response(str(result))
                 if content:

@@ -28,6 +28,7 @@ from openviking.server.error_mapping import map_exception
 from openviking.server.identity import RequestContext, Role
 from openviking.server.models import Response
 from openviking.server.telemetry import run_operation
+from openviking.service.fs_service import MAX_BYTE_RANGE_SIZE
 from openviking.telemetry import TelemetryRequest
 from openviking_cli.exceptions import InvalidArgumentError, NotFoundError, PermissionDeniedError
 from openviking_cli.utils import get_logger
@@ -165,6 +166,56 @@ async def read(
         raise
 
     return Response(status="ok", result=result)
+
+
+@router.get("/range")
+async def read_range(
+    uri: str = Query(..., description="Viking URI"),
+    offset: int = Query(0, ge=0, description="Starting byte offset (0-indexed)"),
+    size: int = Query(
+        MAX_BYTE_RANGE_SIZE,
+        ge=1,
+        le=MAX_BYTE_RANGE_SIZE,
+        description="Number of bytes to read",
+    ),
+    expected_revision: str | None = Query(
+        None,
+        description="Reject the read unless the file still has this revision",
+    ),
+    _ctx: RequestContext = Depends(get_request_context),
+):
+    """Read a bounded raw byte range without loading the complete file."""
+    service = get_service()
+    uri = resolve_path_variables(uri)
+    try:
+        result = await service.fs.read_range(
+            uri,
+            ctx=_ctx,
+            offset=offset,
+            size=size,
+            expected_revision=expected_revision,
+        )
+    except AGFSNotFoundError:
+        raise NotFoundError(uri, "file")
+    except AGFSClientError as e:
+        mapped = map_exception(e, resource=uri, resource_type="file")
+        if mapped is not None:
+            raise mapped from e
+        raise
+
+    next_offset = result["next_offset"]
+    return FastAPIResponse(
+        content=result["content"],
+        media_type="application/octet-stream",
+        headers={
+            "X-OpenViking-Start": str(result["start"]),
+            "X-OpenViking-End": str(result["end"]),
+            "X-OpenViking-Next-Offset": "" if next_offset is None else str(next_offset),
+            "X-OpenViking-EOF": str(result["eof"]).lower(),
+            "X-OpenViking-Total-Size": str(result["total_size"]),
+            "X-OpenViking-Revision": result["revision"],
+        },
+    )
 
 
 @router.get("/abstract")

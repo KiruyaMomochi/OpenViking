@@ -115,7 +115,8 @@ def test_compile_bundle_schema_distinguishes_wiki_pages_and_artifact_files():
     assert (
         "__compile_staging__/wiki_pages/" in page_properties["body_workspace_path"]["description"]
     )
-    assert "filename derives from title" in page_properties["path_hint"]["description"]
+    assert "explicit target-path override" in page_properties["path_hint"]["description"]
+    assert "default target path" in page_properties["body_workspace_path"]["description"]
     assert "supplied source roots" in page_properties["source_ids"]["description"]
     assert "preserve every required path and format" in properties["files"]["description"]
 
@@ -132,6 +133,14 @@ def test_compile_limit_defaults_match_the_resource_envelope():
     assert limits.cleanup_grace_seconds == 40
     assert limits.target_inventory_entries == 2000
     assert limits.target_catalog_pages == 10
+    assert limits.source_range_bytes == 8 * 1024 * 1024
+    assert limits.source_total_io_bytes == 2 * 1024 * 1024 * 1024
+    assert limits.source_map_calls == 128
+    assert limits.source_map_concurrency == 4
+    assert limits.source_map_max_tokens == 512
+    assert limits.agent_context_tokens == 112_000
+    assert limits.agent_thinking_timeout_seconds == 60
+    assert limits.agent_fallback_timeout_seconds == 120
     assert limits.output_pages == 128
     assert limits.output_files == 128
     assert limits.output_operations == 256
@@ -996,6 +1005,7 @@ async def test_submit_tool_resolves_existing_updates_outside_relevant_catalog():
         return uri == wiki_uri
 
     catalog_uris = set()
+
     def make_tool():
         return SubmitWikiBundleTool(
             source_ids={"src_1"},
@@ -1225,6 +1235,7 @@ async def test_submit_tool_materializes_workspace_page_body_before_validation():
         session_key=SessionKey(type="compile", channel_id="cmp", chat_id="cmp"),
         sandbox_manager=Manager(),
     )
+
     def make_tool():
         return SubmitWikiBundleTool(
             source_ids={"src_1"},
@@ -1261,6 +1272,55 @@ async def test_submit_tool_materializes_workspace_page_body_before_validation():
     )
     assert "must be generated with write_file" in rejected
     assert tool.bundle is None
+
+
+@pytest.mark.asyncio
+async def test_staged_wiki_page_path_is_bound_to_its_formal_workspace_path():
+    paths = {
+        "__compile_staging__/wiki_pages/entities/courses/lesson.md": b"Nested body.",
+        "__compile_staging__/wiki_pages/draft.md": b"Explicit body.",
+    }
+
+    class Sandbox:
+        async def read_file_bytes(self, path, *, max_bytes=None):
+            assert max_bytes is not None
+            return paths[path]
+
+    class Manager:
+        async def get_sandbox(self, session_key):
+            return Sandbox()
+
+    tool = SubmitWikiBundleTool(
+        source_ids={"src_1"},
+        catalog_uris=set(),
+        target_uri="viking://resources/wiki",
+        limits=CompileLimits(),
+        require_workspace_pages=True,
+    )
+    nested = _page(1, "Lesson", path_hint=None)
+    nested.pop("body_markdown")
+    nested["body_workspace_path"] = (
+        "__compile_staging__/wiki_pages/entities/courses/lesson.md"
+    )
+    explicit = _page(2, "Draft", path_hint="published/renamed.md")
+    explicit.pop("body_markdown")
+    explicit["body_workspace_path"] = "__compile_staging__/wiki_pages/draft.md"
+
+    accepted = await tool.execute(
+        ToolContext(
+            session_key=SessionKey(type="compile", channel_id="cmp", chat_id="cmp"),
+            sandbox_manager=Manager(),
+        ),
+        pages=[nested, explicit],
+        files=[],
+    )
+
+    assert accepted == "Wiki bundle accepted with 2 page(s) and 0 file(s)."
+    assert tool.bundle is not None
+    assert [page.path_hint for page in tool.bundle.pages] == [
+        "entities/courses/lesson.md",
+        "published/renamed.md",
+    ]
 
 
 @pytest.mark.asyncio
@@ -1308,9 +1368,7 @@ async def test_submit_workspace_reads_enforce_remaining_output_budget(oversized_
         second["body_workspace_path"] = "__compile_staging__/wiki_pages/second.md"
         pages.append(second)
     else:
-        files.append(
-            {"path": "artifact.bin", "workspace_path": "generated/artifact.bin"}
-        )
+        files.append({"path": "artifact.bin", "workspace_path": "generated/artifact.bin"})
 
     result = await tool.execute(context, pages=pages, files=files)
 
@@ -1901,8 +1959,8 @@ async def test_execute_skill_target_skips_recursive_catalog_and_completes(
 
     source_coverage = CoverageLedger(())
 
-    async def build_source_context(client, roots):
-        del client, roots
+    async def build_source_context(client, roots, **kwargs):
+        del client, roots, kwargs
         return CompileSourceContext(
             sources=[], coverage=source_coverage, review_views={}, warnings=[]
         )
@@ -3619,8 +3677,7 @@ async def test_compile_cutoff_preserves_available_work_before_workspace_cleanup(
         assert completed.result.created == []
         if cutoff == "candidate_coverage":
             assert any(
-                "coverage" in item and "incomplete" in item
-                for item in completed.result.warnings
+                "coverage" in item and "incomplete" in item for item in completed.result.warnings
             )
         else:
             assert any("1-iteration limit" in item for item in completed.result.warnings)

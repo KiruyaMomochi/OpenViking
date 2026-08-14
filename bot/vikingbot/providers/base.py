@@ -196,3 +196,17 @@ class LLMProvider(ABC):
     def get_default_model(self) -> str:
         """Get the default model for this provider."""
         pass
+
+
+async def provider_chat_with_thinking(
+    provider: Any,
+    *,
+    thinking: bool | None,
+    **kwargs: Any,
+) -> LLMResponse:
+    """Use a provider-specific thinking override when available."""
+
+    method = getattr(provider, "chat_with_thinking", None)
+    if callable(method):
+        return await method(thinking=thinking, **kwargs)
+    return await provider.chat(**kwargs)

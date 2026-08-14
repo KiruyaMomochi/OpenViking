@@ -6,6 +6,7 @@ configuration semantics are consistent with openviking server's vlm section.
 """
 
 import asyncio
+import inspect
 import time
 from collections.abc import AsyncIterator
 from typing import Any
@@ -25,6 +26,19 @@ from vikingbot.providers.base import (
     stream_delta_value,
 )
 from vikingbot.utils.tracing import get_current_response_id
+
+
+def _accepts_keyword(method: Any, name: str) -> bool:
+    """Return whether a bound method accepts one additive keyword."""
+
+    try:
+        parameters = inspect.signature(method).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD or parameter.name == name
+        for parameter in parameters
+    )
 
 
 class VLMProviderAdapter(LLMProvider):
@@ -57,6 +71,27 @@ class VLMProviderAdapter(LLMProvider):
         temperature: float = 0.7,
         session_id: str | None = None,
     ) -> LLMResponse:
+        return await self.chat_with_thinking(
+            messages=messages,
+            tools=tools,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            session_id=session_id,
+            thinking=None,
+        )
+
+    async def chat_with_thinking(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int | None = None,
+        temperature: float = 0.7,
+        session_id: str | None = None,
+        *,
+        thinking: bool | None = None,
+    ) -> LLMResponse:
         effective_model = model or self._default_model
 
         # --- Langfuse: start observation ---
@@ -86,14 +121,27 @@ class VLMProviderAdapter(LLMProvider):
             # An explicit empty list asks VLM backends for a structured response
             # without exposing tools, so per-response usage is preserved.
             response_tools = tools if tools is not None else []
+            completion = self._vlm.get_completion_async
+            completion_kwargs = {
+                "messages": messages,
+                "thinking": (
+                    getattr(self._vlm, "thinking", None) if thinking is None else thinking
+                ),
+                "tools": response_tools,
+                "tool_choice": "auto" if response_tools else None,
+            }
+            if max_tokens is not None:
+                if _accepts_keyword(completion, "max_tokens"):
+                    completion_kwargs["max_tokens"] = max_tokens
+                else:
+                    logger.warning(
+                        "VLM backend {} does not support per-call max_tokens; using its "
+                        "configured response limit",
+                        type(self._vlm).__name__,
+                    )
             while True:
                 try:
-                    result = await self._vlm.get_completion_async(
-                        messages=messages,
-                        thinking=getattr(self._vlm, "thinking", None),
-                        tools=response_tools,
-                        tool_choice="auto" if response_tools else None,
-                    )
+                    result = await completion(**completion_kwargs)
                     break
                 except Exception as e:
                     if not is_retryable_rate_limit_error(e):
@@ -357,9 +405,7 @@ class VLMProviderAdapter(LLMProvider):
     ) -> dict[str, Any]:
         provider = getattr(vlm, "provider", None)
         configured_max_tokens = getattr(vlm, "max_tokens", None)
-        effective_max_tokens = (
-            configured_max_tokens if configured_max_tokens is not None else max_tokens
-        )
+        effective_max_tokens = max_tokens if max_tokens is not None else configured_max_tokens
         # A wrapped credential owns its model.  The model passed by AgentLoop is
         # the outer/default model and must not overwrite a backup credential.
         effective_model = (

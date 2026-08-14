@@ -35,7 +35,7 @@ from vikingbot.openviking_mount.session_state import (
     parse_local_index,
     reset_openviking_state,
 )
-from vikingbot.providers.base import LLMProvider
+from vikingbot.providers.base import LLMProvider, provider_chat_with_thinking
 from vikingbot.sandbox import SandboxManager
 from vikingbot.session.manager import Session, SessionManager
 from vikingbot.utils.helpers import cal_str_tokens, ensure_non_empty_assistant_content
@@ -333,6 +333,40 @@ class AgentLoop:
                 session_id=session_key.safe_name(),
             )
         return response, streamed_content, streamed_reasoning
+
+    async def _chat_structured_with_timeout_fallback(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        session_key: SessionKey,
+        thinking_timeout_seconds: float,
+        fallback_timeout_seconds: float,
+    ) -> tuple[Any, bool, bool]:
+        """Bound one Compile model call and retry once without long reasoning."""
+
+        kwargs = {
+            "messages": messages,
+            "tools": tools,
+            "model": self.model,
+            "temperature": self.temperature,
+            "session_id": session_key.safe_name(),
+        }
+        try:
+            response = await asyncio.wait_for(
+                provider_chat_with_thinking(self.provider, thinking=None, **kwargs),
+                timeout=thinking_timeout_seconds,
+            )
+        except TimeoutError:
+            logger.warning(
+                "Compile model call exceeded {}s; retrying once with thinking disabled",
+                thinking_timeout_seconds,
+            )
+            response = await asyncio.wait_for(
+                provider_chat_with_thinking(self.provider, thinking=False, **kwargs),
+                timeout=fallback_timeout_seconds,
+            )
+        return response, False, False
 
     def _register_builtin_hooks(self):
         """Register built-in hooks."""
@@ -940,6 +974,8 @@ class AgentLoop:
         openviking_tool_names: list[str] | set[str] | None = None,
         allow_final_fallback: bool = True,
         inject_write_experience: bool = True,
+        context_compactor: Any | None = None,
+        structured_call_timeouts: tuple[float, float] | None = None,
     ) -> tuple[str | None, str | None, list[dict], dict[str, int], int]:
         """
         Run the core agent loop: call LLM, execute tools, repeat until done.
@@ -997,23 +1033,22 @@ class AgentLoop:
         extension_notice_sent = False
         stop_tools = set(stop_tool_names or [])
 
-        def accumulate_token_usage(response: Any) -> None:
-            if not response.usage:
+        def accumulate_usage(usage: dict[str, int] | None) -> None:
+            if not usage:
                 return
-            cur_token = response.usage
-            token_usage["prompt_tokens"] += cur_token.get("prompt_tokens", 0)
-            token_usage["completion_tokens"] += cur_token.get("completion_tokens", 0)
-            token_usage["total_tokens"] += cur_token.get("total_tokens", 0)
+            token_usage["prompt_tokens"] += usage.get("prompt_tokens", 0)
+            token_usage["completion_tokens"] += usage.get("completion_tokens", 0)
+            token_usage["total_tokens"] += usage.get("total_tokens", 0)
 
         while iteration < self.max_iterations:
-            iteration += 1
+            next_iteration = iteration + 1
 
             has_tool = getattr(active_tools, "has", None)
             if (
                 not extension_notice_sent
                 and callable(has_tool)
                 and has_tool("request_compile_extension")
-                and self.max_iterations - iteration <= 4
+                and self.max_iterations - next_iteration <= 4
             ):
                 extension_notice_sent = True
                 messages.append(
@@ -1021,12 +1056,32 @@ class AgentLoop:
                         "role": "user",
                         "content": (
                             f"The normal Compile iteration limit is approaching "
-                            f"({iteration}/{self.max_iterations}). If substantial ledger work "
+                            f"({next_iteration}/{self.max_iterations}). If substantial ledger work "
                             "genuinely remains, you may request the one bounded extension now; "
                             "otherwise finish and submit the safest bounded result."
                         ),
                     }
                 )
+
+            tool_definitions = active_tools.get_definitions(
+                ov_tools_enable=ov_tools_enable,
+                disabled_tools=disabled_tools,
+            )
+            if context_compactor is not None:
+                compacted = await context_compactor.maybe_compact(
+                    messages,
+                    tool_definitions,
+                    iteration=next_iteration,
+                )
+                messages = compacted.messages
+                accumulate_usage(compacted.usage)
+                if compacted.compacted:
+                    logger.info(
+                        "Compile context compacted at iteration {} (messages={})",
+                        next_iteration,
+                        len(messages),
+                    )
+            iteration = next_iteration
 
             if publish_events:
                 await self.bus.publish_outbound(
@@ -1037,17 +1092,26 @@ class AgentLoop:
                     )
                 )
 
-            tool_definitions = active_tools.get_definitions(
-                ov_tools_enable=ov_tools_enable,
-                disabled_tools=disabled_tools,
-            )
-            response, _streamed_content, streamed_reasoning = await self._chat_with_stream_events(
-                messages=messages,
-                tools=tool_definitions,
-                session_key=session_key,
-                publish_events=publish_events,
-            )
-            accumulate_token_usage(response)
+            if structured_call_timeouts is not None:
+                response, _streamed_content, streamed_reasoning = (
+                    await self._chat_structured_with_timeout_fallback(
+                        messages=messages,
+                        tools=tool_definitions,
+                        session_key=session_key,
+                        thinking_timeout_seconds=structured_call_timeouts[0],
+                        fallback_timeout_seconds=structured_call_timeouts[1],
+                    )
+                )
+            else:
+                response, _streamed_content, streamed_reasoning = (
+                    await self._chat_with_stream_events(
+                        messages=messages,
+                        tools=tool_definitions,
+                        session_key=session_key,
+                        publish_events=publish_events,
+                    )
+                )
+            accumulate_usage(response.usage)
 
             if publish_events and response.reasoning_content and not streamed_reasoning:
                 await self.bus.publish_outbound(
@@ -1308,7 +1372,7 @@ class AgentLoop:
                     session_key=session_key,
                     publish_events=publish_events,
                 )
-                accumulate_token_usage(response)
+                accumulate_usage(response.usage)
                 final_content = response.content
                 final_reasoning_content = response.reasoning_content
 
@@ -1342,6 +1406,8 @@ class AgentLoop:
         openviking_tool_names: list[str] | set[str],
         stop_tool_names: list[str],
         openviking_connection: dict[str, Any] | None,
+        context_compactor: Any | None = None,
+        structured_call_timeouts: tuple[float, float] | None = None,
     ) -> tuple[Any, list[dict], dict[str, int], int]:
         """Run a tool-terminated structured task through the existing agent loop."""
 
@@ -1374,6 +1440,8 @@ class AgentLoop:
             openviking_tool_names=openviking_tool_names,
             allow_final_fallback=False,
             inject_write_experience=False,
+            context_compactor=context_compactor,
+            structured_call_timeouts=structured_call_timeouts,
         )
         submit_tool = tool_registry.get("submit_wiki_bundle")
         bundle = getattr(submit_tool, "bundle", None)

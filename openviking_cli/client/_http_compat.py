@@ -6,8 +6,9 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Mapping, Optional
 
 import httpx
 
@@ -35,8 +36,55 @@ from openviking_cli.exceptions import (
     VLMFailedError,
 )
 from openviking_cli.utils.async_utils import run_async
+from openviking_cli.utils.uri import VikingURI
 
 _SESSION_CONFIG_UNSET = object()
+
+
+@dataclass(frozen=True)
+class _CompatRangeRead:
+    content: bytes
+    start: int
+    end: int
+    next_offset: Optional[int]
+    eof: bool
+    total_size: int
+    revision: str
+
+
+_sdk_client_module = getattr(import_openviking_sdk(), "client", None)
+RangeRead = getattr(_sdk_client_module, "RangeRead", _CompatRangeRead)
+
+
+def _range_header(headers: Mapping[str, str], name: str) -> Optional[str]:
+    value = headers.get(name)
+    if value is not None:
+        return str(value)
+    lowered = name.lower()
+    for key, candidate in headers.items():
+        if str(key).lower() == lowered:
+            return str(candidate)
+    return None
+
+
+def _range_header_int(headers: Mapping[str, str], name: str, default: int) -> int:
+    value = _range_header(headers, name)
+    try:
+        return int(value) if value not in (None, "") else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _range_header_bool(headers: Mapping[str, str], name: str, default: bool) -> bool:
+    value = _range_header(headers, name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes"}:
+        return True
+    if normalized in {"0", "false", "no"}:
+        return False
+    return default
 
 ERROR_CODE_TO_EXCEPTION = {
     "INVALID_ARGUMENT": InvalidArgumentError,
@@ -168,6 +216,69 @@ class AsyncHTTPClient(import_openviking_sdk().AsyncHTTPClient):
     def _raise_exception(self, error: Dict[str, Any]) -> None:
         _raise_legacy_exception(error)
 
+    async def read_range(
+        self,
+        uri: str,
+        offset: int = 0,
+        size: int = 16 * 1024 * 1024,
+        expected_revision: Optional[str] = None,
+    ) -> RangeRead:
+        parent_read_range = getattr(super(), "read_range", None)
+        if parent_read_range is not None:
+            return await parent_read_range(
+                uri,
+                offset=offset,
+                size=size,
+                expected_revision=expected_revision,
+            )
+
+        # Keep the main package usable with its supported pre-read_range SDKs.
+        # Those versions already provide the authenticated request and common
+        # error-handling primitives; only this additive endpoint is missing.
+        params: Dict[str, Any] = {
+            "uri": VikingURI.normalize(uri),
+            "offset": offset,
+            "size": size,
+        }
+        if expected_revision is not None:
+            params["expected_revision"] = expected_revision
+        request = getattr(self, "_request", None)
+        if callable(request):
+            response = await request("GET", "/api/v1/content/range", params=params)
+        else:
+            # openviking-sdk 0.1.3 predates the shared _request helper but is
+            # still within the main package's declared dependency range.
+            http = getattr(self, "_http", None)
+            if http is None:
+                raise RuntimeError("Client is not initialized")
+            response = await http.get("/api/v1/content/range", params=params)
+        if not response.is_success:
+            self._handle_response_data(response)
+
+        content = bytes(response.content)
+        headers = response.headers
+        start = _range_header_int(headers, "X-OpenViking-Start", offset)
+        end = _range_header_int(headers, "X-OpenViking-End", start + len(content))
+        total_size = _range_header_int(headers, "X-OpenViking-Total-Size", end)
+        eof = _range_header_bool(headers, "X-OpenViking-EOF", end >= total_size)
+        raw_next_offset = _range_header(headers, "X-OpenViking-Next-Offset")
+        if raw_next_offset in (None, ""):
+            next_offset = None if eof else end
+        else:
+            try:
+                next_offset = int(raw_next_offset)
+            except (TypeError, ValueError):
+                next_offset = None if eof else end
+        return RangeRead(
+            content=content,
+            start=start,
+            end=end,
+            next_offset=next_offset,
+            eof=eof,
+            total_size=total_size,
+            revision=_range_header(headers, "X-OpenViking-Revision") or "",
+        )
+
     async def add_message(
         self,
         session_id: str,
@@ -292,6 +403,22 @@ class SyncHTTPClient(import_openviking_sdk().SyncHTTPClient):
                 turn_id=turn_id,
                 message_kind=message_kind,
                 source_message_ids=source_message_ids,
+            )
+        )
+
+    def read_range(
+        self,
+        uri: str,
+        offset: int = 0,
+        size: int = 16 * 1024 * 1024,
+        expected_revision: Optional[str] = None,
+    ) -> RangeRead:
+        return run_async(
+            self._async_client.read_range(
+                uri,
+                offset=offset,
+                size=size,
+                expected_revision=expected_revision,
             )
         )
 

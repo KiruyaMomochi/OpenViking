@@ -23,11 +23,12 @@ from openviking.utils.path_safety import (
 from openviking.utils.skill_processor import validate_skill_name
 from openviking_cli.exceptions import OpenVikingError
 from vikingbot.agent.tools.base import Tool, ToolContext
-from vikingbot.compile.coverage import CoverageError, CoverageLedger, ReadReceipt
+from vikingbot.compile.coverage import CoverageError, CoverageLedger, ReadReceipt, ReviewUnit
 from vikingbot.compile.models import (
     COMPILE_STAGING_ROOT,
     COMPILE_WIKI_PAGE_ROOT,
     CompileLimits,
+    CompileReviewView,
     WikiBundleDraft,
 )
 from vikingbot.compile.renderer import (
@@ -99,7 +100,7 @@ class CompileScopedTool(Tool):
         result_budget: dict[str, int],
         budget_lock: asyncio.Lock,
         coverage: CoverageLedger | None = None,
-        review_views: Mapping[str, str | Callable[[], Awaitable[str]]] | None = None,
+        review_views: Mapping[str, CompileReviewView] | None = None,
         evidence_cache: dict[str, str] | None = None,
     ):
         self._tool = tool
@@ -109,6 +110,8 @@ class CompileScopedTool(Tool):
         self._budget_lock = budget_lock
         self._coverage = coverage
         self._review_views = dict(review_views or {})
+        if any(not isinstance(view, CompileReviewView) for view in self._review_views.values()):
+            raise TypeError("Compile review views must bind their exact coverage unit IDs")
         self._evidence_cache = evidence_cache if evidence_cache is not None else {}
 
     @property
@@ -165,95 +168,107 @@ class CompileScopedTool(Tool):
         pending_non_substantive: list[tuple[tuple[str, ...], str]] = []
         if self.name == "openviking_multi_read" and self._coverage is not None:
             requested = [str(value).rstrip("/") for value in kwargs.get("uris", [])]
+            # Each URI becomes an independent delivery candidate.  A failed or
+            # oversized item is replaced with a small diagnostic, while later
+            # items can still be delivered and receipted.  This avoids the old
+            # all-or-nothing batch behavior without trusting section markers
+            # across different source URIs.
+            candidates: list[
+                tuple[
+                    str,
+                    str,
+                    dict[str, ReadReceipt],
+                    dict[str, str],
+                    list[tuple[tuple[str, ...], str]],
+                ]
+            ] = []
             for uri in requested:
-                # Reads under the target catalog are useful for incremental
-                # compilation but are not source review units.  They must stay
-                # readable without manufacturing coverage receipts.
                 try:
                     units = self._units_for_locator(uri)
                 except CoverageError:
-                    continue
-                allowed = (
-                    self._limits.adapted_input_bytes
-                    if uri in self._review_views
-                    else self._limits.tool_result_bytes
+                    units = ()
+                try:
+                    (
+                        rendered_result,
+                        item_receipts,
+                        item_evidence,
+                        item_non_substantive,
+                    ) = await self._read_candidate(
+                        uri,
+                        units,
+                        tool_context=tool_context,
+                        kwargs=kwargs,
+                    )
+                except Exception as exc:
+                    detail = str(exc).replace("\n", " ").strip()[:240]
+                    rendered_result = self._item_error(
+                        uri,
+                        f"item read failed ({type(exc).__name__}: {detail})",
+                    )
+                    item_receipts, item_evidence, item_non_substantive = {}, {}, []
+                candidates.append(
+                    (
+                        uri,
+                        rendered_result,
+                        item_receipts,
+                        item_evidence,
+                        item_non_substantive,
+                    )
                 )
-                known_sizes = [
-                    unit.discovered_bytes
-                    for unit in units
-                    if unit.discovered_bytes is not None
-                ]
-                if known_sizes and max(known_sizes) > allowed:
-                    return (
-                        "Error: Compile review unit exceeds its safe read budget; use a "
-                        "Harness-verified summary or report a concrete filtering reason: "
-                        f"{uri} ({max(known_sizes)} bytes > {allowed} bytes)."
-                    )
-            adapted = [uri for uri in requested if uri in self._review_views]
-            delegated = [uri for uri in requested if uri not in self._review_views]
-            sections: list[str] = []
-            section_bytes = 0
 
-            def append_section(*parts: str) -> bool:
-                nonlocal section_bytes
-                added = sum(len(part.encode("utf-8")) for part in parts) + len(parts)
-                if section_bytes + added > self._limits.tool_result_bytes:
-                    return False
-                sections.extend(parts)
-                section_bytes += added
-                return True
+            async with self._budget_lock:
+                task_remaining = max(
+                    0,
+                    self._limits.tool_total_result_bytes - self._result_budget.get("bytes", 0),
+                )
+                delivery_limit = min(self._limits.tool_result_bytes, task_remaining)
+                selected: list[
+                    tuple[
+                        str,
+                        dict[str, ReadReceipt],
+                        dict[str, str],
+                        list[tuple[tuple[str, ...], str]],
+                    ]
+                ] = []
+                used_bytes = 0
+                for uri, item, receipts, evidence, non_substantive in candidates:
+                    separator_bytes = 1 if selected else 0
+                    item_bytes = len(item.encode("utf-8")) + separator_bytes
+                    if used_bytes + item_bytes > delivery_limit:
+                        item = self._item_error(
+                            uri,
+                            "item omitted because a delivery budget was exhausted",
+                        )
+                        receipts, evidence, non_substantive = {}, {}, []
+                        item_bytes = len(item.encode("utf-8")) + separator_bytes
+                    if used_bytes + item_bytes > delivery_limit:
+                        continue
+                    selected.append((item, receipts, evidence, non_substantive))
+                    used_bytes += item_bytes
 
-            for uri in adapted:
-                view = self._review_views[uri]
-                content = await view() if callable(view) else view
-                units = self._units_for_locator(uri)
-                if not content.strip():
-                    if not append_section(
-                        f"--- START OF {uri} ---",
-                        "[Harness: no substantive Codex conversation content]",
-                        f"--- END OF {uri} ---",
-                    ):
-                        return "Error: Compile tool result exceeds the per-call size limit."
-                    pending_non_substantive.append(
-                        (
-                            tuple(unit.unit_id for unit in units),
-                            "Codex adapter inspected the full rollout and verified that it "
-                            "contains only metadata or control records",
-                        )
+                if not selected:
+                    return "Error: Compile task tool-result budget exceeded."
+                result = "\n".join(item for item, *_rest in selected)
+                delivered_size = len(result.encode("utf-8"))
+                self._result_budget["bytes"] = self._result_budget.get("bytes", 0) + delivered_size
+                for _item, receipts, evidence, non_substantive in selected:
+                    self._record_delivered_receipts(
+                        receipts,
+                        evidence,
+                        iteration=tool_context.iteration,
                     )
-                    continue
-                if not append_section(
-                    f"--- START OF {uri} ---",
-                    content,
-                    f"--- END OF {uri} ---",
-                ):
-                    return "Error: Compile tool result exceeds the per-call size limit."
-                for unit in units:
-                    snapshot = next(
-                        item
-                        for item in self._coverage.snapshots
-                        if item.source_id == unit.source_id
-                    )
-                    pending_receipts[unit.unit_id] = ReadReceipt.for_content(
-                        snapshot, unit.unit_id, content
-                    )
-                    pending_evidence[unit.unit_id] = content
-            if delegated:
-                # Execute one URI per underlying call.  This preserves per-URI
-                # success attribution: content from one untrusted source cannot
-                # forge another URI's START/END markers and earn its receipt.
-                for uri in delegated:
-                    rendered_result = str(
-                        await self._tool.execute(tool_context, **{**kwargs, "uris": [uri]})
-                    )
-                    if not append_section(rendered_result):
-                        return "Error: Compile tool result exceeds the per-call size limit."
-                    for receipt in self._receipts_for_single_read(uri, rendered_result):
-                        pending_receipts[receipt.unit_id] = receipt
-                        pending_evidence[receipt.unit_id] = self._single_read_content(
-                            uri, rendered_result
-                        )
-            result = "\n".join(sections)
+                    for unit_ids, reason in non_substantive:
+                        try:
+                            self._coverage.mark_harness_non_substantive(
+                                unit_ids,
+                                reason,
+                                iteration=tool_context.iteration,
+                            )
+                        except CoverageError:
+                            # Delivery remains useful even when stale coverage
+                            # state prevents a deterministic classification.
+                            continue
+            return result
         else:
             result = await self._tool.execute(tool_context, **kwargs)
         if (
@@ -290,12 +305,152 @@ class CompileScopedTool(Tool):
                     )
         return rendered
 
+    @staticmethod
+    def _item_error(uri: str, message: str) -> str:
+        return f"--- COMPILE READ ERROR FOR {uri} ---\n[Harness: {message}]"
+
+    async def _read_candidate(
+        self,
+        uri: str,
+        units: tuple[Any, ...],
+        *,
+        tool_context: ToolContext,
+        kwargs: Mapping[str, Any],
+    ) -> tuple[
+        str,
+        dict[str, ReadReceipt],
+        dict[str, str],
+        list[tuple[tuple[str, ...], str]],
+    ]:
+        receipts: dict[str, ReadReceipt] = {}
+        evidence: dict[str, str] = {}
+        non_substantive: list[tuple[tuple[str, ...], str]] = []
+        review_view = self._review_views.get(uri)
+        if review_view is not None:
+            units = self._bound_units_for_review_view(uri, review_view)
+        allowed = (
+            self._limits.adapted_input_bytes
+            if review_view is not None
+            else self._limits.tool_result_bytes
+        )
+        known_sizes = [unit.discovered_bytes for unit in units if unit.discovered_bytes is not None]
+        if known_sizes and max(known_sizes) > allowed:
+            return (
+                self._item_error(
+                    uri,
+                    "review unit exceeds its safe read budget; use a Harness-verified "
+                    f"summary ({max(known_sizes)} bytes > {allowed} bytes)",
+                ),
+                receipts,
+                evidence,
+                non_substantive,
+            )
+        if review_view is None:
+            rendered = str(await self._tool.execute(tool_context, **{**kwargs, "uris": [uri]}))
+            for receipt in self._receipts_for_single_read(uri, rendered):
+                receipts[receipt.unit_id] = receipt
+                evidence[receipt.unit_id] = self._single_read_content(uri, rendered)
+            return rendered, receipts, evidence, non_substantive
+
+        content_loader = review_view.content
+        content = await content_loader() if callable(content_loader) else content_loader
+        if not isinstance(content, str):
+            raise CoverageError("Harness review view returned non-text content")
+        if not content.strip():
+            rendered = "\n".join(
+                (
+                    f"--- START OF {uri} ---",
+                    "[Harness: no substantive Codex conversation content]",
+                    f"--- END OF {uri} ---",
+                )
+            )
+            non_substantive.append(
+                (
+                    tuple(unit.unit_id for unit in units),
+                    "Harness adapter inspected the full review unit and verified that it "
+                    "contains only metadata or control records",
+                )
+            )
+            return rendered, receipts, evidence, non_substantive
+
+        rendered = "\n".join((f"--- START OF {uri} ---", content, f"--- END OF {uri} ---"))
+        assert self._coverage is not None
+        for unit in units:
+            snapshot = next(
+                item for item in self._coverage.snapshots if item.source_id == unit.source_id
+            )
+            try:
+                receipt = ReadReceipt.for_content(snapshot, unit.unit_id, content)
+            except CoverageError:
+                continue
+            receipts[unit.unit_id] = receipt
+            evidence[unit.unit_id] = content
+        return rendered, receipts, evidence, non_substantive
+
+    def _record_delivered_receipts(
+        self,
+        receipts: Mapping[str, ReadReceipt],
+        evidence: Mapping[str, str],
+        *,
+        iteration: int | None,
+    ) -> None:
+        if self._coverage is None or not receipts:
+            return
+        ordinary: dict[str, ReadReceipt] = {}
+        for unit_id, receipt in receipts.items():
+            unit = self._coverage.by_id[unit_id]
+            if unit.kind != "summary":
+                ordinary[unit_id] = receipt
+                continue
+            try:
+                self._coverage.cover_from_summary(
+                    unit_id,
+                    receipt,
+                    iteration=iteration,
+                )
+            except CoverageError:
+                # A non-verifying summary remains ordinary delivered evidence.
+                try:
+                    self._coverage.record_read(receipt, iteration=iteration)
+                except CoverageError:
+                    continue
+            self._evidence_cache[unit_id] = evidence.get(unit_id, "")
+        if ordinary:
+            try:
+                self._coverage.mark_reviewed(
+                    tuple(ordinary),
+                    ordinary,
+                    iteration=iteration,
+                )
+            except CoverageError:
+                return
+            for unit_id in ordinary:
+                self._evidence_cache[unit_id] = evidence.get(unit_id, "")
+
     def _units_for_locator(self, uri: str):
         assert self._coverage is not None
         units = tuple(unit for unit in self._coverage.units if unit.locator == uri)
         if not units:
             raise CoverageError(f"read URI is not a discovered review unit: {uri}")
         return units
+
+    def _bound_units_for_review_view(
+        self,
+        uri: str,
+        review_view: CompileReviewView,
+    ) -> tuple[ReviewUnit, ...]:
+        assert self._coverage is not None
+        units: list[ReviewUnit] = []
+        for unit_id in review_view.bound_unit_ids:
+            unit = self._coverage.by_id.get(unit_id)
+            if unit is None:
+                raise CoverageError(f"review view references unknown unit {unit_id!r}")
+            if unit.locator != uri:
+                raise CoverageError(
+                    f"review view unit {unit_id!r} does not match its delivery locator"
+                )
+            units.append(unit)
+        return tuple(units)
 
     @staticmethod
     def _single_read_content(uri: str, rendered: str) -> str:
@@ -321,9 +476,7 @@ class CompileScopedTool(Tool):
         try:
             for unit in units:
                 snapshot = next(
-                    item
-                    for item in self._coverage.snapshots
-                    if item.source_id == unit.source_id
+                    item for item in self._coverage.snapshots if item.source_id == unit.source_id
                 )
                 receipts.append(ReadReceipt.for_content(snapshot, unit.unit_id, content))
             return tuple(receipts)
@@ -387,9 +540,7 @@ class ReportCoverageTool(Tool):
             if action == "skip":
                 if len(unit_ids or []) > 200 or len(reason or "") > 1200:
                     return "Error: Coverage skip exceeds the per-call reporting limit."
-                self.coverage.skip(
-                    unit_ids or [], reason or "", iteration=tool_context.iteration
-                )
+                self.coverage.skip(unit_ids or [], reason or "", iteration=tool_context.iteration)
             elif action == "cover":
                 if len(unit_ids or []) > 200:
                     return "Error: Coverage cover exceeds the per-call reporting limit."
@@ -404,13 +555,10 @@ class ReportCoverageTool(Tool):
             return f"Error: Invalid coverage report: {exc}"
         summary = self.coverage.summary()
         issues = [
-            issue if len(issue) <= 600 else issue[:600] + "..."
-            for issue in summary["issues"][:8]
+            issue if len(issue) <= 600 else issue[:600] + "..." for issue in summary["issues"][:8]
         ]
         visible_units = [
-            unit
-            for unit in self.coverage.units
-            if source_id is None or unit.source_id == source_id
+            unit for unit in self.coverage.units if source_id is None or unit.source_id == source_id
         ][offset : offset + limit]
         return json.dumps(
             {
@@ -430,7 +578,8 @@ class ReportCoverageTool(Tool):
                 ],
                 "next_offset": (
                     offset + len(visible_units)
-                    if offset + len(visible_units) < len(
+                    if offset + len(visible_units)
+                    < len(
                         [
                             unit
                             for unit in self.coverage.units
@@ -550,6 +699,7 @@ class SubmitWikiBundleTool(Tool):
         quality_judge: (
             Callable[[WikiBundleDraft, list[bytes | None]], Awaitable[tuple[str, str]]] | None
         ) = None,
+        result_budget: Mapping[str, int] | None = None,
     ):
         self.source_ids = source_ids
         self.catalog_uris = catalog_uris
@@ -568,6 +718,7 @@ class SubmitWikiBundleTool(Tool):
         self.exec_enabled = exec_enabled
         self.coverage = coverage
         self.quality_judge = quality_judge
+        self.result_budget = result_budget
         self.bundle: WikiBundleDraft | None = None
         self.file_payloads: list[bytes | None] = []
         self.skill_name: str | None = None
@@ -585,6 +736,76 @@ class SubmitWikiBundleTool(Tool):
         self._lock = asyncio.Lock()
         self.requires_partial = False
         self.partial_reason: str | None = None
+
+    def checkpoint_status(self) -> dict[str, Any]:
+        """Return a bounded, read-only snapshot for Compile context compaction."""
+
+        coverage_summary = self.coverage.summary() if self.coverage is not None else None
+        pending = []
+        if self.coverage is not None:
+            for unit in self.coverage.units:
+                if not unit.required or self.coverage.status(unit.unit_id).value != "pending":
+                    continue
+                pending.append(
+                    {
+                        "unit_id": unit.unit_id,
+                        "source_id": unit.source_id,
+                        "locator": unit.locator,
+                        **(
+                            {"range": [unit.range_start, unit.range_end]}
+                            if unit.range_start is not None
+                            else {}
+                        ),
+                    }
+                )
+                if len(pending) >= 8:
+                    break
+        candidate = self.candidate_bundle
+        return {
+            "coverage": (
+                {
+                    "counts": coverage_summary["counts"],
+                    "sources": coverage_summary["sources"],
+                    "complete": coverage_summary["complete"],
+                    "issues": [str(issue)[:500] for issue in coverage_summary["issues"][:5]],
+                    "pending_examples": pending,
+                    "pending_query": "Use report_compile_coverage with pagination for details.",
+                }
+                if coverage_summary is not None
+                else None
+            ),
+            "tool_result_budget": (
+                {
+                    "used_bytes": int(self.result_budget.get("bytes", 0)),
+                    "limit_bytes": self.limits.tool_total_result_bytes,
+                    "remaining_bytes": max(
+                        0,
+                        self.limits.tool_total_result_bytes
+                        - int(self.result_budget.get("bytes", 0)),
+                    ),
+                }
+                if self.result_budget is not None
+                else None
+            ),
+            "submission": {
+                "accepted": self.bundle is not None,
+                "candidate_present": candidate is not None,
+                "candidate_pages": len(candidate.pages) if candidate is not None else 0,
+                "candidate_files": len(candidate.files) if candidate is not None else 0,
+                "candidate_paths": (
+                    [
+                        page.path_hint or page.update_uri or f"title:{page.title}"
+                        for page in candidate.pages[:16]
+                    ]
+                    + [file.path or file.update_uri or "" for file in candidate.files[:16]]
+                    if candidate is not None
+                    else []
+                ),
+                "quality_judge_calls": self._judge_calls,
+                "revision_requested": self._revision_requested,
+                "requires_partial": self.requires_partial,
+            },
+        }
 
     @property
     def _is_skill_target(self) -> bool:
@@ -699,9 +920,7 @@ class SubmitWikiBundleTool(Tool):
             self._last_submit_iteration = tool_context.iteration
             if self.bundle is not None:
                 return "Compile bundle was already accepted; duplicate submission ignored."
-            return await self._execute_locked(
-                tool_context, pages=pages, files=files, links=links
-            )
+            return await self._execute_locked(tool_context, pages=pages, files=files, links=links)
 
     async def _execute_locked(
         self,
@@ -972,8 +1191,22 @@ class SubmitWikiBundleTool(Tool):
                 raise ValueError(
                     f"page {page.page_id} body_workspace_path must contain UTF-8 Markdown"
                 ) from exc
+            path_hint = page.path_hint
+            if path_hint is None and page.update_uri is None:
+                page_root = f"{COMPILE_WIKI_PAGE_ROOT}/"
+                if not workspace_path.startswith(page_root):
+                    raise ValueError(
+                        f"page {page.page_id} body must be under {page_root}"
+                    )
+                path_hint = validate_relative_page_path(workspace_path.removeprefix(page_root))
             pages.append(
-                page.model_copy(update={"body_markdown": body, "body_workspace_path": None})
+                page.model_copy(
+                    update={
+                        "body_markdown": body,
+                        "body_workspace_path": None,
+                        "path_hint": path_hint,
+                    }
+                )
             )
         return bundle.model_copy(update={"pages": pages})
 
