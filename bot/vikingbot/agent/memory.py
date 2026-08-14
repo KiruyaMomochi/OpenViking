@@ -142,13 +142,22 @@ class MemoryStore:
 
     @classmethod
     def _dedupe_memories(cls, memories: list[Any]) -> list[Any]:
+        """Deduplicate memories by canonical identity.
+
+        Uses filename as the dedupe key since the same logical memory can appear
+        under multiple peer URIs (e.g., peers/kyaru/memories/events/foo.md and
+        peers/yozakura/memories/events/foo.md both refer to the same memory file).
+        """
         deduped: list[Any] = []
-        seen_uris: set[str] = set()
+        seen_filenames: set[str] = set()
         for memory in memories:
             uri = cls._get_uri(memory)
-            if not uri or uri in seen_uris:
+            if not uri:
                 continue
-            seen_uris.add(uri)
+            filename = cls._filename_from_uri(uri)
+            if not filename or filename in seen_filenames:
+                continue
+            seen_filenames.add(filename)
             deduped.append(memory)
         return deduped
 
@@ -233,14 +242,57 @@ class MemoryStore:
         )
 
     @staticmethod
+    def _truncate_memory_content(content: str, uri: str, max_chars: int = 2000) -> str:
+        """Truncate memory content to preserve summary but limit chatlog length.
+
+        For event memories with ChatLog sections, keeps the summary and truncates
+        the chatlog body to stay within max_chars. Appends a marker indicating
+        the full content can be fetched via viking_read.
+
+        Args:
+            content: Full memory content
+            uri: Memory URI for reference in truncation marker
+            max_chars: Maximum characters for the returned content
+
+        Returns:
+            Truncated content with marker if truncation occurred
+        """
+        if len(content) <= max_chars:
+            return content
+
+        # Try to extract summary and chatlog separately
+        chatlog_match = re.search(r"ChatLog:\s*\n", content, re.IGNORECASE)
+        if chatlog_match:
+            # Split at the ChatLog marker
+            pre_chatlog = content[: chatlog_match.end()]
+            chatlog_body = content[chatlog_match.end() :]
+
+            # If pre-chatlog part is already over budget, truncate everything
+            if len(pre_chatlog) >= max_chars:
+                truncated = content[:max_chars]
+                return f"{truncated}\n... [content truncated, full log: {uri}]"
+
+            # Otherwise, truncate the chatlog body
+            remaining_chars = max_chars - len(pre_chatlog) - 60  # reserve space for marker
+            if remaining_chars > 100:
+                truncated_chatlog = chatlog_body[:remaining_chars]
+                return f"{pre_chatlog}{truncated_chatlog}\n... [chatlog truncated, full log: {uri}]"
+
+        # No chatlog pattern found, just truncate
+        truncated = content[:max_chars]
+        return f"{truncated}\n... [content truncated, full log: {uri}]"
+
+    @staticmethod
     def _format_full_memory(idx: int, uri: str, score: float, content: str) -> str:
         filename = MemoryStore._filename_from_uri(uri)
+        # Truncate content to prevent overlong context injection
+        truncated_content = MemoryStore._truncate_memory_content(content, uri, max_chars=2000)
         return (
             f'<memory index="{idx}" type="full">\n'
             f"  <uri>{uri}</uri>\n"
             f"  <filename>{filename}</filename>\n"
             f"  <score>{score}</score>\n"
-            f"  <content>{content}</content>\n"
+            f"  <content>{truncated_content}</content>\n"
             f"</memory>"
         )
 
