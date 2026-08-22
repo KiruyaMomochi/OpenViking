@@ -7,6 +7,10 @@ from pydantic import BaseModel, Field
 class RetrievalConfig(BaseModel):
     """Configuration for query planning and context assembly."""
 
+    episodic_decay_alpha: float = Field(default=0.0, ge=0.0, le=1.0)
+    episodic_half_life_days: float = Field(default=30.0, gt=0.0)
+    episodic_uri_segment: str = Field(default="/memories/events/")
+
     recall_intent_timeout_s: float = Field(
         default=5.0,
         gt=0.0,

@@ -19,6 +19,7 @@ from openviking.models.embedder.base import (
     embedder_supports_multimodal,
 )
 from openviking.models.rerank import RerankClient
+from openviking.retrieve.memory_lifecycle import episodic_decay_factor, is_episodic_uri
 from openviking.retrieve.retrieval_stats import get_stats_collector
 from openviking.server.identity import RequestContext
 from openviking.storage.abstract_overview import AbstractOverviewFormatError, body_for_preview
@@ -27,6 +28,7 @@ from openviking.storage.vikingdb_manager import VikingDBManager, VikingDBManager
 from openviking.telemetry import get_current_telemetry
 from openviking.utils.tags import normalize_search_tags
 from openviking.utils.time_decay import parse_duration_ms
+from openviking.utils.time_utils import parse_iso_datetime
 from openviking.utils.token_estimation import (
     estimate_text_tokens,
     truncate_text_to_token_budget,
@@ -38,7 +40,7 @@ from openviking_cli.retrieve.types import (
     QueryResult,
     TypedQuery,
 )
-from openviking_cli.utils.config import RerankConfig
+from openviking_cli.utils.config import RerankConfig, RetrievalConfig, get_openviking_config
 from openviking_cli.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -60,6 +62,7 @@ class HierarchicalRetriever:
         storage: VikingDBManager,
         embedder: Optional[Any],
         rerank_config: Optional[RerankConfig] = None,
+        retrieval_config: Optional[RetrievalConfig] = None,
     ):
         """Initialize retriever with rerank_config.
 
@@ -72,6 +75,10 @@ class HierarchicalRetriever:
         self.embedder = embedder
         self.rerank_config = rerank_config
         self.rerank_max_input_tokens = rerank_config.max_input_tokens if rerank_config else 0
+        self.retrieval_config = retrieval_config or get_openviking_config().retrieval
+        self.episodic_decay_alpha = self.retrieval_config.episodic_decay_alpha
+        self.episodic_half_life_days = self.retrieval_config.episodic_half_life_days
+        self.episodic_uri_segment = self.retrieval_config.episodic_uri_segment
 
         # Use rerank threshold if available, otherwise use a default
         self.threshold = rerank_config.threshold if rerank_config else 0
@@ -231,6 +238,12 @@ class HierarchicalRetriever:
             )
 
         # A low vector score can still rerank highly, so filter only after reranking.
+        # An explicit upstream decay request takes precedence over fork decay.
+        if events_time_decay_protection is None:
+            scores = [
+                self._apply_episodic_decay(candidate, score)
+                for candidate, score in zip(candidates, scores, strict=True)
+            ]
         candidates = [
             {**candidate, "_final_score": score}
             for candidate, score in zip(candidates, scores, strict=True)
@@ -272,6 +285,28 @@ class HierarchicalRetriever:
         if score_gte:
             return score >= threshold
         return score > threshold
+
+    @staticmethod
+    def _coerce_datetime(value: Any) -> Optional[datetime]:
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, str):
+            try:
+                return parse_iso_datetime(value)
+            except (ValueError, TypeError):
+                return None
+        return None
+
+    def _apply_episodic_decay(self, record: Any, score: float) -> float:
+        """Blend age decay into episodic scores before the final threshold gate."""
+        if self.episodic_decay_alpha <= 0:
+            return score
+        if not is_episodic_uri(record.get("uri", ""), self.episodic_uri_segment):
+            return score
+        recorded_at = self._coerce_datetime(record.get("created_at") or record.get("updated_at"))
+        factor = episodic_decay_factor(recorded_at, half_life_days=self.episodic_half_life_days)
+        beta = self.episodic_decay_alpha
+        return score * ((1 - beta) + beta * factor)
 
     async def _rerank_scores(
         self,
