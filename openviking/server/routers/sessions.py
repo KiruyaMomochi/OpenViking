@@ -713,6 +713,18 @@ async def extract_session(
     return Response(status="ok", result=_to_jsonable(result))
 
 
+@router.post("/{session_id}/extract-archive/{archive_id}")
+async def extract_session_archive(
+    session_id: str = Path(..., description="Session ID"),
+    archive_id: str = Path(..., description="Archive ID"),
+    _ctx: RequestContext = Depends(get_session_request_context),
+):
+    """Extract memories from an archived session."""
+    service = get_service()
+    result = await service.sessions.extract_from_archive(session_id, archive_id, _ctx)
+    return Response(status="ok", result=_to_jsonable(result))
+
+
 @router.post("/{session_id}/messages")
 async def add_message(
     request: AddMessageRequest,

@@ -490,6 +490,28 @@ class SessionService:
         self._record_lifecycle_metric("extract", "ok")
         return memories
 
+    async def extract_from_archive(
+        self, session_id: str, archive_id: str, ctx: RequestContext
+    ) -> List[Any]:
+        """Extract memories from an archived session."""
+        self._ensure_initialized()
+        if not self._session_compressor:
+            raise NotInitializedError("SessionCompressorV3")
+
+        session = await self.get(session_id, ctx)
+        archive_uri = f"{session.uri}/history/{archive_id}"
+        messages = await session._archives.read_messages(archive_uri)
+        memories = await self._session_compressor.extract_long_term_memories(
+            messages=messages,
+            user=ctx.user,
+            session_id=session_id,
+            ctx=ctx,
+            archive_uri=f"{archive_uri}/reprocess",
+            agent_evolution_enabled=await self.get_agent_evolution_enabled(ctx.account_id),
+        )
+        self._record_lifecycle_metric("extract_from_archive", "ok")
+        return memories
+
     @staticmethod
     def effective_auto_commit_policy(session: Session) -> Optional[Dict[str, Any]]:
         """Return the resolved auto-commit policy (defaults filled), or None when disabled."""
