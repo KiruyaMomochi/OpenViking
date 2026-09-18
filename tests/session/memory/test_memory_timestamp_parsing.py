@@ -88,8 +88,8 @@ def test_message_range_uses_peer_id_when_present():
         ]
     )
 
-    assert "[web-visitor-alice]: invoice follow-up" in msg_range.pretty_print()
-    assert "[default]: invoice follow-up" not in msg_range.pretty_print()
+    assert "**web-visitor-alice**: invoice follow-up" in msg_range.pretty_print()
+    assert "**default**: invoice follow-up" not in msg_range.pretty_print()
 
 
 def test_message_range_uses_configured_speaker_label_without_peer_id(monkeypatch):
@@ -102,7 +102,7 @@ def test_message_range_uses_configured_speaker_label_without_peer_id(monkeypatch
         [[Message(id="msg-user", role="user", parts=[TextPart(text="invoice follow-up")])]]
     )
 
-    assert msg_range.pretty_print() == "[33]: invoice follow-up"
+    assert msg_range.pretty_print() == "**33**: invoice follow-up"
 
 
 def test_extraction_context_chunks_long_text_and_preserves_decimal_numbers(stub_provider_config):
