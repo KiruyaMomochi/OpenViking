@@ -129,6 +129,15 @@ _LEVEL_ENDPOINTS = {"abstract": "/api/v1/content/abstract", "overview": "/api/v1
 _LEVEL_MAX_CHARS = {"abstract": 1200, "overview": 4000}
 _DEFAULT_AVAILABLE_MEMORIES_LIMIT = 5
 _RECALL_SUMMARY_KEYS = ("abstract", "overview", "text", "content")
+_CHATLOG_HEADING_RE = re.compile(
+    r"^[ \t]*(?:#{1,6}[ \t]*)?(?:\d{4}-\d{2}-\d{2}(?:[ \t]+\([^)]+\))?[ \t]+)?"
+    r"ChatLog:[ \t]*$",
+    re.IGNORECASE,
+)
+_MARKDOWN_HEADING_RE = re.compile(r"^[ \t]*#{1,6}[ \t]+\S")
+_CODE_FENCE_LINE_RE = re.compile(r"^[ \t]*`{3,}[^\n]*$")
+_SPEAKER_ROW_RE = re.compile(r"^[ \t]*\*\*[^*\n]+\*\*:[ \t]*.*$")
+_MEMORY_FIELDS_START_RE = re.compile(r"^[ \t]*<!--[ \t]*MEMORY_FIELDS\b", re.IGNORECASE)
 
 
 def _cfg_field(key: str, description: str, **extra) -> dict:
@@ -279,6 +288,36 @@ def _derive_openviking_user_text(content: Any) -> str:
     """Strip Hermes slash-skill scaffolding before sending content to OpenViking
     (MemoryManager already does this for the fan-out; kept for direct hook callers)."""
     return extract_user_instruction_from_skill_message(content) or ""
+
+
+def _project_recalled_memory(content: str) -> str:
+    """Exclude transcripts/metadata from the prompt-facing copy, not stored files."""
+    projected: List[str] = []
+    in_fence = False
+    dropping_chatlog = False
+    for line in content.splitlines(keepends=True):
+        stripped = line.rstrip("\r\n")
+        is_fence = bool(_CODE_FENCE_LINE_RE.match(stripped))
+        if dropping_chatlog:
+            if is_fence:
+                in_fence = not in_fence
+                continue
+            if not in_fence and _MARKDOWN_HEADING_RE.match(stripped):
+                dropping_chatlog = False
+            else:
+                continue
+        if not in_fence:
+            if _CHATLOG_HEADING_RE.match(stripped):
+                dropping_chatlog = True
+                continue
+            if _MEMORY_FIELDS_START_RE.match(stripped):
+                break
+            if _SPEAKER_ROW_RE.match(stripped):
+                continue
+        projected.append(line)
+        if is_fence:
+            in_fence = not in_fence
+    return "".join(projected).rstrip()
 
 
 def _preview(value: Any, limit: int = 160) -> str:
@@ -2125,9 +2164,19 @@ class OpenVikingMemoryProvider(MemoryProvider):
                             raise ValueError("OpenViking did not confirm actor-scoped context")
                         if (assembled.get("stats") or {}).get("rewrite") == "no_relevant":
                             return ""
-                        return str(
+                        content = _project_recalled_memory(str(
                             assembled.get("digest") or assembled.get("rendered") or ""
-                        ).strip()
+                        ).strip())
+                        if not content:
+                            return ""
+                        entry = '\n'.join([
+                            '<retrieved-memory provider="openviking" category="context">',
+                            '  <summary>',
+                            *[f"  {line}" for line in content.splitlines()],
+                            '  </summary>',
+                            '</retrieved-memory>',
+                        ])
+                        return entry if len(entry) <= cfg["max_injected_chars"] else ""
                 except TimeoutError:
                     raise
                 except Exception as e:
@@ -2539,8 +2588,18 @@ class OpenVikingMemoryProvider(MemoryProvider):
                     logger.debug("OpenViking prefetch full read failed for %s: %s", uri, e)
             if not content:
                 continue
+            content = _project_recalled_memory(content)
+            if not content:
+                continue
             category = str(item.get("category") or "").strip() or "memory"
-            entry = "\n".join([f"- [{category}]", f"  <uri>{item.get('uri', '')}</uri>", *[f"  {line}" for line in content.splitlines()]])
+            entry = "\n".join([
+                f'<retrieved-memory provider="openviking" category={json.dumps(category, ensure_ascii=False)}>',
+                f"  <source-uri>{item.get('uri', '')}</source-uri>",
+                "  <summary>",
+                *[f"  {line}" for line in content.splitlines()],
+                "  </summary>",
+                "</retrieved-memory>",
+            ])
             projected_chars = total_chars + (1 if entries else 0) + len(entry)
             if projected_chars <= max_injected_chars:
                 entries.append(entry)

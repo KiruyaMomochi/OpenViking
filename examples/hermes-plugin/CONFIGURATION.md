@@ -50,6 +50,19 @@ still applies. Legacy `user_display_name` and `agent_display_name` are retained 
 configuration but are not consumed by this plugin (nor by the old bundled plugin);
 they do not override the connection identity or memory speaker names.
 
+## Prompt-facing recall projection
+
+Automatic recall excludes dated/undated `ChatLog:` sections, standalone bold
+speaker rows, and trailing `MEMORY_FIELDS` metadata. Fenced examples outside
+ChatLog sections and summary paragraph spacing are preserved. Recalled summaries
+are enclosed in `retrieved-memory` reference-data blocks; the server-compressed
+`digest`/`rendered` path applies the same projection and character cap.
+This supersedes the earlier recall-time ChatLog blank-line compaction: the
+transcript is now omitted, rather than compressed. Stored files and explicit
+`viking_read` results are unchanged. Hermes core owns placement relative to the
+live request and historical `api_content` replay; this plugin does not rewrite
+either.
+
 ## Quick Local model support
 
 Quick Local copies Hermes's language model settings into its own server config.

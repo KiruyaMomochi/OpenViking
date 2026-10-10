@@ -413,6 +413,11 @@ def test_cloud_recall(external_provider, monkeypatch, mode, rewrite, response, e
     monkeypatch.setenv("OPENVIKING_RECALL_COMPRESS", mode)
     client = Mock()
     client.post.return_value = {"result": response}
+    if expected:
+        expected = (
+            '<retrieved-memory provider="openviking" category="context">\n'
+            f"  <summary>\n  {expected}\n  </summary>\n</retrieved-memory>"
+        )
     assert (
         provider._search_prefetch_context(
             "remember deployment preferences", session_id="session", client=client
