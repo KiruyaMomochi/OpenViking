@@ -605,6 +605,7 @@ def test_external_provider_keeps_user_identity_across_reload(
     external_provider, monkeypatch, operation
 ):
     _, provider, module, _ = external_provider("identity-reload")
+    monkeypatch.setenv("OPENVIKING_SESSION_START_PROFILE", "true")
     captured = threading.Event()
     resume = threading.Event()
     requests = []

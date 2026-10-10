@@ -23,6 +23,33 @@ OPENVIKING_ENDPOINT=http://127.0.0.1:1933
 The default profile uses `~/.hermes/.env`. A named profile uses
 `~/.hermes/profiles/<profile>/.env`. Start a new Hermes session after changing it.
 
+## Session-start injection
+
+The existing `memory.openviking` configuration shape is unchanged:
+
+```yaml
+memory:
+  openviking:
+    session_start_profile: false
+    session_start_memories: true
+    available_memories_limit: 5
+```
+
+`session_start_profile` controls the profile read/injection;
+`session_start_memories` controls preferences/entities listings. Disabling both
+skips all session-start requests. `available_memories_limit` caps readable entries
+per category (1–100); omitted entries are reported with a `+N more` tail when it
+fits. `profile_token_budget` still bounds the complete session-start block.
+The matching `OPENVIKING_SESSION_START_PROFILE`, `OPENVIKING_SESSION_START_MEMORIES`,
+and `OPENVIKING_AVAILABLE_MEMORIES_LIMIT` environment values override YAML.
+All settings remain bound to the initialized profile, even in multi-profile hosts.
+
+Existing YAML `user`, `agent`, and `recall_score_threshold` keep the same names
+and meanings; no rename is needed. Connection environment/linked config precedence
+still applies. Legacy `user_display_name` and `agent_display_name` are retained in
+configuration but are not consumed by this plugin (nor by the old bundled plugin);
+they do not override the connection identity or memory speaker names.
+
 ## Quick Local model support
 
 Quick Local copies Hermes's language model settings into its own server config.

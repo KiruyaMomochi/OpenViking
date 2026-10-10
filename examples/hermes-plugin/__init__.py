@@ -127,6 +127,7 @@ _READ_BATCH_LIMIT = 3
 _READ_BATCH_FULL_LIMIT = 2500
 _LEVEL_ENDPOINTS = {"abstract": "/api/v1/content/abstract", "overview": "/api/v1/content/overview", "full": "/api/v1/content/read"}
 _LEVEL_MAX_CHARS = {"abstract": 1200, "overview": 4000}
+_DEFAULT_AVAILABLE_MEMORIES_LIMIT = 5
 _RECALL_SUMMARY_KEYS = ("abstract", "overview", "text", "content")
 
 
@@ -158,6 +159,9 @@ _CONFIG_SCHEMA = [
     _cfg_field("recall_score_threshold", "Minimum relevance score for automatic recall", type="number", minimum=0.0, maximum=1.0, step=0.01, default=0.15),
     _cfg_field("recall_max_injected_chars", "Maximum total characters injected by recall", type="integer", minimum=100, maximum=50000, default=4000),
     _cfg_field("profile_token_budget", "Maximum session-start memory tokens injected", type="integer", minimum=500, maximum=50000, default=6000),
+    _cfg_field("session_start_profile", "Inject the user profile at session start", type="boolean", default=False),
+    _cfg_field("session_start_memories", "List available memories at session start", type="boolean", default=True),
+    _cfg_field("available_memories_limit", "Maximum readable entries listed per memory category", type="integer", minimum=1, maximum=100, default=_DEFAULT_AVAILABLE_MEMORIES_LIMIT),
     _cfg_field("recall_timeout_seconds", "Total timeout for recall (seconds)", **_NUM, default=4.0),
     _cfg_field("recall_request_timeout_seconds", "Per-request timeout for recall (seconds)", **_NUM, default=_DEFAULT_RECALL_REQUEST_TIMEOUT_SECONDS),
     _cfg_field("recall_full_read_limit", "Max full L2 content reads per recall", type="integer", minimum=0, maximum=100, default=2),
@@ -2235,6 +2239,14 @@ class OpenVikingMemoryProvider(MemoryProvider):
 
     # -- session-start memory block -----------------------------------------
 
+    def _session_start_config(self) -> Dict[str, Any]:
+        cfg, env = self._profile_config_and_env()
+        return {
+            "profile": self._setting("session_start_profile", cfg, env=env),
+            "memories": self._setting("session_start_memories", cfg, env=env),
+            "available_memories_limit": self._setting("available_memories_limit", cfg, env=env),
+        }
+
     @staticmethod
     def _unwrap_result(resp: Any) -> Any:
         """Return OpenViking payload body regardless of wrapped/unwrapped shape."""
@@ -2339,7 +2351,8 @@ class OpenVikingMemoryProvider(MemoryProvider):
         return "\n".join(lines)
 
     @classmethod
-    def _format_memory_listing(cls, uri: str, entries: List[Dict[str, str]], max_units: int) -> tuple[List[str], int]:
+    def _format_memory_listing(cls, uri: str, entries: List[Dict[str, str]], max_units: int,
+                               max_entries: int = _DEFAULT_AVAILABLE_MEMORIES_LIMIT) -> tuple[List[str], int]:
         """Listing lines within max_units; degrades to a "+N more" tail or a one-line stub."""
         if not entries or max_units <= 0:
             return [], 0
@@ -2352,7 +2365,8 @@ class OpenVikingMemoryProvider(MemoryProvider):
 
         lines = [header]
         newline_units = cls._token_units("\n")
-        for index, entry in enumerate(entries):
+        stopped_for_budget = False
+        for index, entry in enumerate(entries[:max_entries]):
             abstract = entry.get("abstract", "")
             line = f"    - {entry['name']}{f' — {abstract}' if abstract else ''}"
             line_units = newline_units + cls._token_units(line)
@@ -2362,14 +2376,29 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 if used + tail_units <= max_units:
                     lines.append(tail)
                     used += tail_units
+                stopped_for_budget = True
                 break
             lines.append(line)
             used += line_units
+        if not stopped_for_budget:
+            hidden = len(entries) - (len(lines) - 1)
+            if hidden:
+                tail = f"    ... +{hidden} more, use `viking_search`"
+                tail_units = newline_units + cls._token_units(tail)
+                while len(lines) > 1 and used + tail_units > max_units:
+                    used -= newline_units + cls._token_units(lines.pop())
+                    hidden += 1
+                    tail = f"    ... +{hidden} more, use `viking_search`"
+                    tail_units = newline_units + cls._token_units(tail)
+                if used + tail_units <= max_units:
+                    lines.append(tail)
+                    used += tail_units
         return lines, used
 
     @classmethod
     def _build_session_start_memory_block(cls, *, profile: str, preferences: List[Dict[str, str]],
-                                          entities: List[Dict[str, str]], token_budget: int, uris: Optional[tuple] = None) -> str:
+                                          entities: List[Dict[str, str]], token_budget: int, uris: Optional[tuple] = None,
+                                          available_memories_limit: int = _DEFAULT_AVAILABLE_MEMORIES_LIMIT) -> str:
         """Profile (<= half the budget) then preferences/entities listings sharing the rest."""
         profile_uri, preferences_uri, entities_uri = uris or tuple(f"viking://user/default/{suffix}" for suffix in _SESSION_START_SUFFIXES)
         profile = profile.strip()
@@ -2389,8 +2418,10 @@ class OpenVikingMemoryProvider(MemoryProvider):
             available_units -= cls._token_units(profile_text)
 
         preference_budget = available_units // 2 if (preferences and entities) else available_units
-        preference_lines, preference_units = cls._format_memory_listing(preferences_uri, preferences, preference_budget)
-        entity_lines, _ = cls._format_memory_listing(entities_uri, entities, available_units - preference_units)
+        preference_lines, preference_units = cls._format_memory_listing(
+            preferences_uri, preferences, preference_budget, max_entries=available_memories_limit)
+        entity_lines, _ = cls._format_memory_listing(
+            entities_uri, entities, available_units - preference_units, max_entries=available_memories_limit)
         return cls._assemble_session_start_memory_block(profile_text, preference_lines, entity_lines, profile_uri=profile_uri)
 
     def _session_start_memory_context(self, session_id: str) -> str:
@@ -2402,6 +2433,9 @@ class OpenVikingMemoryProvider(MemoryProvider):
         try:
             client = self._client
             if not client:
+                return ""
+            session_start_cfg = self._session_start_config()
+            if not session_start_cfg["profile"] and not session_start_cfg["memories"]:
                 return ""
             cfg = self._recall_config()
             deadline, request_timeout = time.monotonic() + cfg["timeout_seconds"], cfg["request_timeout_seconds"]
@@ -2415,13 +2449,14 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 return ""
             uris = tuple(f"viking://user/{user}/{suffix}" for suffix in _SESSION_START_SUFFIXES)
             try:
-                profile = self._extract_text_content(budgeted_get("/api/v1/content/read", {"uri": uris[0]}))
+                profile = (self._extract_text_content(budgeted_get("/api/v1/content/read", {"uri": uris[0]}))
+                           if session_start_cfg["profile"] else "")
             except Exception as e:
                 if _status_code_from_error(e) not in {404, 410}:
                     return ""
                 profile = ""
             listings = []
-            for uri in uris[1:]:
+            for uri in uris[1:] if session_start_cfg["memories"] else ():
                 try:
                     listings.append(self._extract_memory_listing(budgeted_get("/api/v1/fs/ls", {"uri": uri, **_SESSION_START_LIST_PARAMS})))
                 except Exception:
@@ -2431,7 +2466,9 @@ class OpenVikingMemoryProvider(MemoryProvider):
             return ""
         self._profile_prefetched_sessions.add(session_key)
         return self._build_session_start_memory_block(
-            profile=profile, preferences=listings[0], entities=listings[1], token_budget=self._profile_token_budget(), uris=uris,
+            profile=profile, preferences=listings[0] if listings else [], entities=listings[1] if len(listings) > 1 else [],
+            token_budget=self._profile_token_budget(), uris=uris,
+            available_memories_limit=session_start_cfg["available_memories_limit"],
         )
 
     # -- recall ranking ------------------------------------------------------
